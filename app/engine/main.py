@@ -2,24 +2,37 @@ import asyncio
 import io
 import torch
 from fastapi import FastAPI, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 
+# Import our custom modules
 from tracer.renderer import render_1spp_kernel
 from brain.flow import RectifiedFlowUnet
 
 app = FastAPI()
 
+# Add CORS Middleware to allow WebSocket connections from the Node Gateway
+app.add_middleware(
+  CORSMiddleware,
+  allow_origins=["*"],  # Allow all origins (for local development)
+  allow_credentials=False, # FIXED: Cannot be True when allow_origins is ["*"]
+  allow_methods=["*"],
+  allow_headers=["*"],
+)
+
+# 1. Initialize the Neural Network on the GPU
 model = RectifiedFlowUnet().cuda()
 model.eval()
 
+# 2. Pre-allocate the Shared VRAM Buffer (Zero-Copy)
 WIDTH, HEIGHT = 512, 512
-
+# Shape for Taichi: (Width, Height, 3)
 shared_vram_buffer = torch.zeros((WIDTH, HEIGHT, 3), dtype=torch.float32, device='cuda')
 
-@app.websocket("/ws/renderer")
+@app.websocket("/ws/render")
 async def render_loop(websocket: WebSocket):
   await websocket.accept()
-
+  
   try:
     while True:
       # 1. Receive camera coordinates from Node.js transport
@@ -48,5 +61,6 @@ async def render_loop(websocket: WebSocket):
       byte_frame = buf.getvalue()
       
       await websocket.send_bytes(byte_frame)
+      
   except Exception as e:
-    print(f"Connection Closed: {e}")
+    print(f"Connection closed: {e}")

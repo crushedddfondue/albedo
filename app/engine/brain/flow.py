@@ -6,7 +6,7 @@ import torch.nn as nn
 
 class RectifiedFlowUnet(nn.Module):
   def __init__(self)-> None:
-    super(),__init__()  # type: ignore
+    super().__init__()
 
     self.net = nn.Sequential(
       nn.Conv2d(3, 32, kernel_size=3, padding=1),
