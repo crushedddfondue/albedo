@@ -1,3 +1,18 @@
 # Virtual Environment
 venv/
 .venv/
+
+# Node Modules
+node_modules/
+
+# Environment Variavles
+*.env*
+*.env
+.env*
+
+# Python Bytecode
+__pycache__/
+
+# Project Assets
+assets/
+public/
