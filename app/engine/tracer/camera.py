@@ -11,6 +11,7 @@ class PinholeCamera:
     self.pitch_angle = math.radians(pitch_angle)
 
   # This is to generate the right vector and up vector for our pinhole camera
+  @ti.func
   def orhonormal_basis_generation(self):
     """
     We are trying to create the x, y, z components of our forward vector:
@@ -45,6 +46,7 @@ class PinholeCamera:
     return forward, right_vector, up_vector
 
   # To generate a ray-vector
+  @ti.func
   def ray_generation(self, x_ndc, y_ndc, fov_angle, aspect_ratio):
     forward, right, up = self.orhonormal_basis_generation()
 
