@@ -16,3 +16,9 @@ __pycache__/
 # Project Assets
 assets/
 public/
+
+# Pytest Cache
+.pytest_cache/
+
+# Dataset Directory
+dataset/
