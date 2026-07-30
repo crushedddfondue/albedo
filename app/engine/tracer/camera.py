@@ -7,12 +7,14 @@ ti.init(arch=ti.cuda)
 class PinholeCamera:
   def __init__(self, position, yaw_angle, pitch_angle):
     self.position = position
+    
+    # FIX: Use standard Python math for CPU-side initialization
     self.yaw_angle = math.radians(yaw_angle)
     self.pitch_angle = math.radians(pitch_angle)
 
   # This is to generate the right vector and up vector for our pinhole camera
   @ti.func
-  def orhonormal_basis_generation(self):
+  def orthonormal_basis_generation(self):
     """
     We are trying to create the x, y, z components of our forward vector:
 
@@ -23,9 +25,9 @@ class PinholeCamera:
       f_y: sin(phi)
       f_z: sin(theta)*cos(phi)
     """
-    forward_x = math.cos(self.yaw_angle) * math.cos(self.pitch_angle)
-    forward_y = math.sin(self.pitch_angle)
-    forward_z = math.sin(self.yaw_angle) * math.cos(self.pitch_angle)
+    forward_x = ti.math.cos(self.yaw_angle) * ti.math.cos(self.pitch_angle)
+    forward_y = ti.math.sin(self.pitch_angle)
+    forward_z = ti.math.sin(self.yaw_angle) * ti.math.cos(self.pitch_angle)
 
     # Combining the 3 components in x-direction, y-direction and z-direction
     forward = vec3(forward_x, forward_y, forward_z)
@@ -48,7 +50,7 @@ class PinholeCamera:
   # To generate a ray-vector
   @ti.func
   def ray_generation(self, x_ndc, y_ndc, fov_angle, aspect_ratio):
-    forward, right, up = self.orhonormal_basis_generation()
+    forward, right, up = self.orthonormal_basis_generation()
 
     """
     This is to return field-of-view scale s:
@@ -57,7 +59,8 @@ class PinholeCamera:
 
     here fov_angle is in radians.
     """
-    fov_scale = math.tan(math.radians(fov_angle) / 2.0)
+    # FIX: Use Taichi's math for GPU-side calculations
+    fov_scale = ti.math.tan(ti.math.radians(fov_angle) / 2.0)
 
     """
     Horizontal Component:
