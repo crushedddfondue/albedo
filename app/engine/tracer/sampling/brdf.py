@@ -16,6 +16,13 @@ class BRDF:
     return f_r
 
   @ti.func
+  def pdf(self, cos_theta: ti.f32)-> ti.f32:  # type: ignore
+    result = 0.0
+    if cos_theta > 0.0:
+      result = cos_theta / ti.math.pi
+    return result
+
+  @ti.func
   def sample_cosine_weighted_bounce(self, albedo: vec3, cos_theta: ti.f32, l_i: vec3)-> vec3: # type: ignore
     result = vec3(0.0)
 
