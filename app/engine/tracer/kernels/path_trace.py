@@ -1,9 +1,11 @@
+# path_trace.py
 import taichi as ti
 from taichi.math import vec3, normalize
 
 from tracer.geometry.primitives import Ray, Triangle, HitRecord, ray_triangle_intersect
 from tracer.sampling.rng import rotate_to_world_space
-from tracer.sampling.nee import weighted_nee_sample, solid_angle_pdf
+from tracer.sampling.nee import weighted_nee_sample, solid_angle_pdf, pick_light
+from tracer.bvh.traverse import traverse_closest_hit
 
 RAY_OFFSET_EPSILON = 1e-4
 RR_MIN_BOUNCES = 3
@@ -38,7 +40,7 @@ def intersect_scene(ray: Ray, triangles: ti.template(), num_triangles: ti.i32) -
 
 
 @ti.func
-def path_trace(ray: Ray, brdf: ti.template(), triangles: ti.template(), num_triangles: ti.i32, light_triangle: Triangle, light_area_pdf: ti.f32, single_sided: ti.i32, max_bounces: ti.i32):  # type: ignore
+def path_trace(ray: Ray, brdf: ti.template(), triangles: ti.template(), num_triangles: ti.i32, bvh_node_min: ti.template(), bvh_node_max: ti.template(), bvh_node_left: ti.template(), bvh_node_right: ti.template(), bvh_node_start: ti.template(), bvh_node_count: ti.template(), bvh_indices: ti.template(), light_triangle_index: ti.template(), light_pdf_area: ti.template(), num_lights: ti.i32, single_sided: ti.i32, max_bounces: ti.i32,):  # type: ignore
   radiance = vec3(0.0)
   throughput = vec3(1.0)
 
@@ -48,7 +50,11 @@ def path_trace(ray: Ray, brdf: ti.template(), triangles: ti.template(), num_tria
   current_ray = ray
 
   for bounce in range(max_bounces):
-    hit = intersect_scene(current_ray, triangles, num_triangles)
+    hit = traverse_closest_hit(
+      current_ray.origin, current_ray.direction,
+      bvh_node_min, bvh_node_max, bvh_node_left, bvh_node_right,
+      bvh_node_start, bvh_node_count, bvh_indices, triangles,
+    )
 
     if hit.hit == 0:
       break
@@ -57,7 +63,8 @@ def path_trace(ray: Ray, brdf: ti.template(), triangles: ti.template(), num_tria
       if bounce == 0:
         radiance += throughput * hit.emission
       else:
-        p_light_here = solid_angle_pdf(prev_x, hit.position, hit.normal, light_area_pdf, single_sided)
+        hit_pdf_area = light_pdf_area[hit.light_index] / num_lights
+        p_light_here = solid_angle_pdf(prev_x, hit.position, hit.normal, hit_pdf_area, single_sided)
 
         w_brdf = 0.0
         denom = prev_p_bsdf * prev_p_bsdf + p_light_here * p_light_here
@@ -66,9 +73,19 @@ def path_trace(ray: Ray, brdf: ti.template(), triangles: ti.template(), num_tria
 
         radiance += throughput * w_brdf * hit.emission
 
-    u1, u2 = ti.random(ti.f32), ti.random(ti.f32)
-    l_dir = weighted_nee_sample(hit.position, hit.normal, hit.albedo, light_triangle, u1, u2, triangles, num_triangles, single_sided, brdf)
-    radiance += throughput * l_dir
+    if num_lights > 0:
+      u1, u2, u3 = ti.random(ti.f32), ti.random(ti.f32), ti.random(ti.f32)
+      light_idx = pick_light(u3, num_lights)
+      light_tri = triangles[light_triangle_index[light_idx]]
+      pdf_area = light_pdf_area[light_idx] / num_lights
+
+      l_dir = weighted_nee_sample(
+        hit.position, hit.normal, hit.albedo, light_tri, pdf_area, u1, u2,
+        bvh_node_min, bvh_node_max, bvh_node_left, bvh_node_right,
+        bvh_node_start, bvh_node_count, bvh_indices,
+        triangles, single_sided, brdf,
+      )
+      radiance += throughput * l_dir
 
     tangent, bitangent = build_tangent_space(hit.normal)
     bounce_dir, pdf_brdf = rotate_to_world_space(tangent, bitangent, hit.normal)
