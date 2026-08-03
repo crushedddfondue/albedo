@@ -2,7 +2,7 @@ import taichi as ti
 from taichi.math import vec3
 
 from tracer.geometry import scene
-
+from tracer.bvh.builder import build_bvh, upload_to_taichi
 
 @ti.kernel
 def _write_test_room():
@@ -38,3 +38,5 @@ def build_test_room():
   _write_test_room()
   scene.recompute_normals()
   scene.build_light_list()
+  build_bvh()
+  upload_to_taichi()
