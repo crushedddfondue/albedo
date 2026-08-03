@@ -54,7 +54,7 @@ class Camera:
   def update_orientation(self, dx: float, dy: float, sensitivity: float = 0.0025):
     """
     Assume the position of camera to be (x, y) in the world space.
-    Let's say that the mouse is set to sensitivity σ and the user moves their mouse in world space 
+    Let's say that the mouse is set to sensitivity σ and the user moves their mouse in world space
     by (dx, dy).
 
     Now, we update the rotation on the X and Y axes (i.e: pitch and yaw)
@@ -71,11 +71,63 @@ class Camera:
     yaw += dx * σ
     pitch += dy * σ
 
-    We also make sure to clip pitch so that it doesn't exceed MAX_PITCH (89.5 degrees)
+    We also make sure to clip pitch so that it doesn't exceed MAX_PITCH (89.5 degrees).
+
+    yaw has no such bound -- left unwrapped, += accumulates without limit over a
+    long session. That's not just untidy: sin/cos of a very large accumulated angle
+    lose precision from range-reduction error in float32 long before it's visibly
+    wrong, so it's a session-length-dependent bug that's miserable to reproduce.
+    Wrapping yaw into (-pi, pi] after every update keeps the value driving sin/cos
+    always small, independent of how long the camera has been running.
     """
     self.yaw += dx * sensitivity
     self.pitch += dy * sensitivity
     self.pitch = np.clip(self.pitch, -MAX_PITCH, MAX_PITCH)
+    self.yaw = ((self.yaw + math.pi) % (2.0 * math.pi)) - math.pi
+
+  def update_position(self, keys: dict, right: np.ndarray, forward: np.ndarray, dt: float, speed: float = 3.0):
+    """
+    Called once per rendered frame -- NOT once per keypress event. `keys` is a
+    snapshot of which movement keys are currently held (booleans), sampled at
+    render time. `right`/`forward` are passed in rather than recomputed here
+    because the frame loop is expected to call basis_from_yaw_pitch() once and
+    hand the result to both this method and primary_ray_generation -- computing
+    the basis twice per frame would be redundant work for the same answer.
+  
+    `dt` is the server's own measured elapsed time since the last frame
+    (e.g. via time.perf_counter() in the frame loop), NOT a value the client
+    reports. If the client stamped dt itself, network jitter in when input
+    packets arrive would make movement speed stutter independent of anything
+    the player did -- the server measuring its own frame time keeps movement
+    speed tied to actual render rate, immune to transport timing noise.
+  
+    Free-fly: `forward` is used exactly as basis_from_yaw_pitch() returns it,
+    unprojected. Looking up and holding "forward" flies you upward -- correct
+    for a scene-inspection camera. (If FPS-style ground-locked movement is
+    ever wanted instead -- e.g. once the Java terrain service is live and a
+    ground plane actually exists to walk on -- the only change needed is
+    swapping `forward` below for its horizontal projection,
+    normalize((forward[0], 0, forward[2])). Nothing else in this function
+    changes.)
+    """
+    move_fwd = (1.0 if keys.get("forward") else 0.0) - (1.0 if keys.get("back") else 0.0)
+    move_right = (1.0 if keys.get("right") else 0.0) - (1.0 if keys.get("left") else 0.0)
+    move_up = (1.0 if keys.get("up") else 0.0) - (1.0 if keys.get("down") else 0.0)
+  
+    # All three axes (forward/back, strafe, vertical) combined into one vector
+    # before normalizing -- not just forward+strafe. Folding vertical in too
+    # means holding forward+up together is capped to the same speed as any
+    # single-key direction, same reasoning as the horizontal-only case, just
+    # applied to all three axes uniformly rather than treating vertical as a
+    # separate uncapped speed.
+    direction = move_fwd * forward + move_right * right + move_up * WORLD_UP
+    norm = np.linalg.norm(direction)
+  
+    # No keys held -> direction is the zero vector -> normalizing would be
+    # 0/0. Guard first, same as every other near-zero-before-dividing case
+    # this build (BRDF grazing angle, MIS weight denominators, RR clamp).
+    if norm > 1e-8:
+      self.position += (direction / norm) * speed * dt
 
   # Calculating the basis vectors we are going from (x, y, z) --> (r, u, f)
   def basis_from_yaw_pitch(self):
@@ -86,7 +138,7 @@ class Camera:
     f = (cos(pitch) * sin(yaw), sin(pitch), -cos(pitch) * cos(yaw))
 
     f = f / || f || (normalizing the f vector) --> we need direction not magnitude, unit vector in same direction will do
-    
+
     r = f x WORLD_UP / || f x WORLD_UP || (cross product of f and global up vector)
 
     u = r x f / || r x f || (cross product of r and f)
@@ -171,12 +223,12 @@ class Camera:
     jitter: (j_x, j_y)  --> random number (i.e j_x, j_y in [0, 1))
     aspect_ratio = a
     (r, u, f) = (right, up, forward) --> basis vectors
-      
+
     x_ndc = (2 * (p_x + j_x) / width)-1
     y_ndc = 1 - (2 * (p_y + j_y)/height)
-  
+
     where width and height are the dimensions of the image plane.
-  
+
     d_world = (x_ndc * a * tan(fov/2) * r + y_ndc * tan(fov/2) * u + f) / || (x_ndc * a * tan(fov/2) * r + y_ndc * tan(fov/2) * u + f) ||
     """
     tan_half_fov = math.tan(fov / 2.0)
