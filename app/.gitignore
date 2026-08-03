@@ -22,3 +22,6 @@ public/
 
 # Dataset Directory
 dataset/
+
+# Archived Files
+archive.txt
