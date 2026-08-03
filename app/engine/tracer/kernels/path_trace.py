@@ -6,6 +6,9 @@ from tracer.sampling.rng import rotate_to_world_space
 from tracer.sampling.nee import weighted_nee_sample, solid_angle_pdf
 
 RAY_OFFSET_EPSILON = 1e-4
+RR_MIN_BOUNCES = 3
+RR_Q_MIN = 0.05
+RR_Q_MAX = 0.95
 
 
 @ti.func
@@ -73,7 +76,14 @@ def path_trace(ray: Ray, brdf: ti.template(), triangles: ti.template(), num_tria
 
     throughput *= brdf.sample_cosine_weighted_bounce(hit.albedo, cos_theta, vec3(1.0))
 
-    # Russian roulette goes here once task 10 exists
+    if bounce >= RR_MIN_BOUNCES:
+      gamma = ti.random(ti.f32)
+      q = ti.math.clamp(ti.max(throughput.x, ti.max(throughput.y, throughput.z)), RR_Q_MIN, RR_Q_MAX)
+
+      if gamma > q:
+        break
+
+      throughput /= q
 
     prev_x = hit.position
     prev_p_bsdf = pdf_brdf
