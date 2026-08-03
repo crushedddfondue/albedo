@@ -2,32 +2,27 @@ import taichi as ti
 from taichi.math import vec3
 
 from tracer.bvh.traverse import compute_visibility
+from tracer.geometry.primitives import Triangle
 
 
 @ti.func
-def sample_emissive_triangle(v0, v1, v2, u1, u2):
+def sample_emissive_triangle(triangle: Triangle, u1, u2):  # type: ignore
   sqrt_u1 = ti.sqrt(u1)
   b0 = 1.0 - sqrt_u1
   b1 = u2 * sqrt_u1
   b2 = sqrt_u1 * (1.0 - u2)
 
-  x_l = b0 * v0 + b1 * v1 + b2 * v2
+  x_l = b0 * triangle.v0 + b1 * triangle.v1 + b2 * triangle.v2
 
-  edge1 = v1 - v0
-  edge2 = v2 - v0
-  cross_prod = ti.math.cross(edge1, edge2)
-
-  cross_len = cross_prod.norm()
-  area = 0.5 * cross_len
+  edge1 = triangle.v1 - triangle.v0
+  edge2 = triangle.v2 - triangle.v0
+  area = 0.5 * ti.math.cross(edge1, edge2).norm()
 
   pdf_area = 0.0
-  n_l = vec3(0.0)
-
   if area > 1e-8:
     pdf_area = 1.0 / area
-    n_l = cross_prod / cross_len
 
-  return x_l, n_l, pdf_area
+  return x_l, pdf_area
 
 
 @ti.func
@@ -49,12 +44,12 @@ def solid_angle_pdf(x: vec3, x_l: vec3, n_l: vec3, pdf_area: ti.f32, single_side
 
 
 @ti.func
-def compute_direct_lighting(x: vec3, n: vec3, albedo: vec3, v0: vec3, v1: vec3, v2: vec3, l_e: vec3, u1: ti.f32, u2: ti.f32, triangles: ti.template(), num_triangles: ti.i32, single_sided: ti.i32, brdf: ti.template()):  # type: ignore
+def compute_direct_lighting(x: vec3, n: vec3, albedo: vec3, triangle: Triangle, u1: ti.f32, u2: ti.f32, triangles: ti.template(), num_triangles: ti.i32, single_sided: ti.i32, brdf: ti.template()):  # type: ignore
   l_dir = vec3(0.0)
   w_l = vec3(0.0)
   p_light = 0.0
 
-  x_l, n_l, pdf_area = sample_emissive_triangle(v0, v1, v2, u1, u2)
+  x_l, pdf_area = sample_emissive_triangle(triangle, u1, u2)
 
   if pdf_area > 0.0:
     to_light = x_l - x
@@ -65,21 +60,21 @@ def compute_direct_lighting(x: vec3, n: vec3, albedo: vec3, v0: vec3, v1: vec3, 
 
       cos_theta = ti.math.dot(n, w_l)
       if cos_theta > 0.0:
-        p_light = solid_angle_pdf(x, x_l, n_l, pdf_area, single_sided)
+        p_light = solid_angle_pdf(x, x_l, triangle.normal, pdf_area, single_sided)
 
         if p_light > 0.0:
           V = compute_visibility(x, n, x_l, dist_to_light, triangles, num_triangles)
 
           if V > 0.0:
             f_r = brdf.evaluate(albedo)
-            l_dir = (f_r * l_e * cos_theta * V) / p_light
+            l_dir = (f_r * triangle.emission * cos_theta * V) / p_light
 
   return l_dir, w_l, p_light
 
 
 @ti.func
-def weighted_nee_sample(x: vec3, n: vec3, albedo: vec3, v0: vec3, v1: vec3, v2: vec3, l_e: vec3, u1: ti.f32, u2: ti.f32, triangles: ti.template(), num_triangles: ti.i32, single_sided: ti.i32, brdf: ti.template()):  # type: ignore
-  l_dir, w_l, p_light = compute_direct_lighting(x, n, albedo, v0, v1, v2, l_e, u1, u2, triangles, num_triangles, single_sided, brdf)
+def weighted_nee_sample(x: vec3, n: vec3, albedo: vec3, triangle: Triangle, u1: ti.f32, u2: ti.f32, triangles: ti.template(), num_triangles: ti.i32, single_sided: ti.i32, brdf: ti.template()):  # type: ignore
+  l_dir, w_l, p_light = compute_direct_lighting(x, n, albedo, triangle, u1, u2, triangles, num_triangles, single_sided, brdf)
 
   final_l_dir = vec3(0.0)
 
