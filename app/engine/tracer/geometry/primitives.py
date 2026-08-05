@@ -15,6 +15,7 @@ Triangle = ti.types.struct(
 HitRecord = ti.types.struct(
   hit=ti.i32, t=ti.f32,
   position=vec3, normal=vec3, albedo=vec3, light_index=ti.i32,
+  emission=vec3,
 )
 
 
@@ -33,7 +34,7 @@ def ray_triangle_intersect(ray: Ray, triangle: Triangle, t_min: ti.f32, t_max: t
   p_vec = ti.math.cross(ray.direction, edge2)
   det = ti.math.dot(edge1, p_vec)
 
-  record = HitRecord(hit=0, t=0.0, position=vec3(0.0), normal=vec3(0.0), albedo=vec3(0.0), light_index=-1)
+  record = HitRecord(hit=0, t=0.0, position=vec3(0.0), normal=vec3(0.0), albedo=vec3(0.0), light_index=-1, emission=vec3(0.0))
 
   if ti.abs(det) > EPSILON:
     inv_det = 1.0 / det
@@ -54,5 +55,6 @@ def ray_triangle_intersect(ray: Ray, triangle: Triangle, t_min: ti.f32, t_max: t
           record.normal = triangle.normal
           record.albedo = triangle.albedo
           record.light_index = triangle.light_index
+          record.emission = triangle.emission
 
   return record

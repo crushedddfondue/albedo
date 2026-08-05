@@ -22,7 +22,6 @@ The camera will be able to:
 """
 
 # Imports
-from __future__ import annotations
 
 import math
 

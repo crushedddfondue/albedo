@@ -1,6 +1,6 @@
 import taichi as ti
 
-from app.engine.tracer.sampling.hemisphere import cosine_weighted_sample_hemisphere
+from tracer.sampling.hemisphere import cosine_weighted_sample_hemisphere
 
 """
 Method to convert direction sampled from cosine_weighted_sample_hemisphere(u1, u2)

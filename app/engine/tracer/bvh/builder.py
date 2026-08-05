@@ -1,7 +1,7 @@
 import numpy as np
 import taichi as ti
 
-from tracer.geometry.scene import triangles, num_triangles
+from tracer.geometry import scene
 
 LEAF_SIZE = 4
 
@@ -19,7 +19,7 @@ bvh_node_left = None
 bvh_node_right = None
 bvh_node_start = None
 bvh_node_count = None
-bvh_indices_field = None
+bvh_indices = None
 
 
 def build(tri_idx_list):
@@ -62,11 +62,11 @@ def build_bvh():
   live at the top of camera.py: import order isn't something to depend on."""
   global centroids, tri_min, tri_max, root_index
 
-  n = num_triangles[None]
+  n = scene.num_triangles[None]
 
-  v0 = triangles.v0.to_numpy()[:n]
-  v1 = triangles.v1.to_numpy()[:n]
-  v2 = triangles.v2.to_numpy()[:n]
+  v0 = scene.triangles.v0.to_numpy()[:n]
+  v1 = scene.triangles.v1.to_numpy()[:n]
+  v2 = scene.triangles.v2.to_numpy()[:n]
 
   centroids = (v0 + v1 + v2) / 3.0
   tri_min = np.minimum(np.minimum(v0, v1), v2)
@@ -80,7 +80,7 @@ def build_bvh():
 
 
 def upload_to_taichi():
-  global bvh_node_min, bvh_node_max, bvh_node_left, bvh_node_right, bvh_node_start, bvh_node_count, bvh_indices_field
+  global bvh_node_min, bvh_node_max, bvh_node_left, bvh_node_right, bvh_node_start, bvh_node_count, bvh_indices
 
   n_nodes = len(nodes)
   n_indices = len(bvh_triangle_indices)
@@ -91,7 +91,7 @@ def upload_to_taichi():
   bvh_node_right = ti.field(dtype=ti.i32, shape=(n_nodes,))
   bvh_node_start = ti.field(dtype=ti.i32, shape=(n_nodes,))
   bvh_node_count = ti.field(dtype=ti.i32, shape=(n_nodes,))
-  bvh_indices_field = ti.field(dtype=ti.i32, shape=(n_indices,))
+  bvh_indices = ti.field(dtype=ti.i32, shape=(n_indices,))
 
   bvh_node_min.from_numpy(np.array([n["min"] for n in nodes], dtype=np.float32))
   bvh_node_max.from_numpy(np.array([n["max"] for n in nodes], dtype=np.float32))
@@ -99,4 +99,4 @@ def upload_to_taichi():
   bvh_node_right.from_numpy(np.array([n["right"] for n in nodes], dtype=np.int32))
   bvh_node_start.from_numpy(np.array([n["start"] for n in nodes], dtype=np.int32))
   bvh_node_count.from_numpy(np.array([n["count"] for n in nodes], dtype=np.int32))
-  bvh_indices_field.from_numpy(np.array(bvh_triangle_indices, dtype=np.int32))
+  bvh_indices.from_numpy(np.array(bvh_triangle_indices, dtype=np.int32))
