@@ -38,7 +38,7 @@ def ray_triangle_intersection(ray_o: vec3, ray_d: vec3, v0: vec3, v1: vec3, v2: 
 def compute_visibility(x: vec3, n: vec3, x_l: vec3, dist_to_light: ti.f32, bvh_node_min: ti.template(), bvh_node_max: ti.template(), bvh_node_left: ti.template(), bvh_node_right: ti.template(), bvh_node_start: ti.template(), bvh_node_count: ti.template(), bvh_indices: ti.template(), triangles: ti.template(),) -> ti.f32:  # type: ignore
   ray_o = x + n * RAY_OFFSET_EPSILON
   ray_d = normalize(x_l - x)
-  t_max = dist_to_light - RAY_OFFSET_EPSILON
+  t_max = dist_to_light - (1.0 - 1e-3) 
 
   occluded = traverse_any_hit(
     ray_o, ray_d, t_max,

@@ -25,3 +25,6 @@ dataset/
 
 # Archived Files
 archive.txt
+
+# Numpy Files
+*.npy

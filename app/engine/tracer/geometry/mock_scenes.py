@@ -30,8 +30,16 @@ def _write_test_room():
     v0=vec3(-1.0, 4.0, -1.0), v1=vec3(1.0, 4.0, 1.0), v2=vec3(-1.0, 4.0, 1.0),
     normal=vec3(0.0), albedo=vec3(0.0), emission=vec3(10.0, 10.0, 10.0), light_index=-1,
   )
+  scene.triangles[4] = scene.Triangle(
+    v0=vec3(-0.75, 2.0, -0.75), v1=vec3(0.75, 2.0, 0.75), v2=vec3(0.75, 2.0, -0.75),
+    normal=vec3(0.0), albedo=vec3(0.8), emission=vec3(0.0), light_index=-1,
+  )
+  scene.triangles[5] = scene.Triangle(
+    v0=vec3(-0.75, 2.0, -0.75), v1=vec3(-0.75, 2.0, 0.75), v2=vec3(0.75, 2.0, 0.75),
+    normal=vec3(0.0), albedo=vec3(0.8), emission=vec3(0.0), light_index=-1,
+  )
 
-  scene.num_triangles[None] = 4
+  scene.num_triangles[None] = 6
 
 
 def build_test_room():
