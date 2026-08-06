@@ -30,6 +30,11 @@ def _write_test_room():
     v0=vec3(-1.0, 4.0, -1.0), v1=vec3(1.0, 4.0, 1.0), v2=vec3(-1.0, 4.0, 1.0),
     normal=vec3(0.0), albedo=vec3(0.0), emission=vec3(10.0, 10.0, 10.0), light_index=-1,
   )
+
+  # Occluder (2 triangles), y=2, albedo 0.8, non-emissive. Same winding as
+  # the floor, so the geometric normal points up. Takes the scene to 6
+  # triangles against LEAF_SIZE = 4, which is what makes build() recurse and
+  # produce an actual tree rather than a single leaf node.
   scene.triangles[4] = scene.Triangle(
     v0=vec3(-0.75, 2.0, -0.75), v1=vec3(0.75, 2.0, 0.75), v2=vec3(0.75, 2.0, -0.75),
     normal=vec3(0.0), albedo=vec3(0.8), emission=vec3(0.0), light_index=-1,
@@ -42,8 +47,35 @@ def _write_test_room():
   scene.num_triangles[None] = 6
 
 
+@ti.kernel
+def _make_furnace():
+  """Overwrite material properties for the white furnace test.
+
+  Geometry is unchanged -- only albedo and emission move. Unit albedo makes
+  the analytic answer exactly the environment radiance L, and removing all
+  emission leaves num_lights = 0 so NEE is skipped and the environment is the
+  only light source in the scene, which is the entire point of the test.
+
+  Reads num_triangles rather than hardcoding 6 so it stays correct if the
+  test room grows.
+  """
+  for i in range(scene.num_triangles[None]):  # type: ignore
+    scene.triangles[i].albedo = vec3(1.0)  # type: ignore
+    scene.triangles[i].emission = vec3(0.0)  # type: ignore
+    scene.triangles[i].light_index = -1  # type: ignore
+
+
 def build_test_room():
   _write_test_room()
+  scene.recompute_normals()
+  scene.build_light_list()
+  build_bvh()
+  upload_to_taichi()
+
+
+def build_furnace_scene():
+  _write_test_room()
+  _make_furnace()
   scene.recompute_normals()
   scene.build_light_list()
   build_bvh()
