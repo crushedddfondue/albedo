@@ -2,16 +2,15 @@
 import taichi as ti
 from taichi.math import vec3, normalize
 
-from tracer.geometry.primitives import Ray, Triangle, HitRecord, ray_triangle_intersect
+from tracer.constants import RAY_ORIGIN_EPSILON, EMISSION_FACING_EPSILON
+from tracer.geometry.primitives import Ray
 from tracer.sampling.rng import rotate_to_world_space
 from tracer.sampling.nee import weighted_nee_sample, solid_angle_pdf, pick_light
 from tracer.bvh.traverse import traverse_closest_hit
 
-RAY_OFFSET_EPSILON = 1e-4
 RR_MIN_BOUNCES = 3
 RR_Q_MIN = 0.05
 RR_Q_MAX = 0.95
-EMISSION_FACING_EPSILON = 1e-6
 
 
 @ti.func
@@ -24,24 +23,6 @@ def build_tangent_space(n: vec3):  # type: ignore
   bitangent = ti.math.cross(n, tangent)
 
   return tangent, bitangent
-
-
-@ti.func
-def intersect_scene(ray: Ray, triangles: ti.template(), num_triangles: ti.i32) -> HitRecord:  # type: ignore
-  # NOTE: still dead code, kept until the end-of-phase cleanup pass. The
-  # HitRecord initializer below was missing emission= -- same omission that
-  # produced the AttributeError in traverse_closest_hit -- so this would have
-  # thrown the moment it was actually called.
-  closest = HitRecord(hit=0, t=0.0, position=vec3(0.0), normal=vec3(0.0), albedo=vec3(0.0), light_index=-1, emission=vec3(0.0))
-  closest_t = 1e30
-
-  for i in range(num_triangles):
-    candidate = ray_triangle_intersect(ray, triangles[i], RAY_OFFSET_EPSILON, closest_t)
-    if candidate.hit == 1:
-      closest = candidate
-      closest_t = candidate.t
-
-  return closest
 
 
 @ti.func
@@ -62,6 +43,10 @@ def path_trace(ray: Ray, brdf: ti.template(), triangles: ti.template(), num_tria
     )
 
     if hit.hit == 0:
+      # FOLLOW-UP: this is correct only for a black environment. Once
+      # tracer/environment.py exists the miss case becomes a contribution,
+      # radiance += throughput * L_env(current_ray.direction), which is also
+      # what makes the white furnace test possible.
       break
 
     # ---- Emission. Uses hit.normal, the TRUE geometric normal, deliberately:
@@ -140,6 +125,10 @@ def path_trace(ray: Ray, brdf: ti.template(), triangles: ti.template(), num_tria
     bounce_dir, pdf_brdf = rotate_to_world_space(tangent, bitangent, shading_normal)
     cos_theta = ti.math.dot(shading_normal, bounce_dir)
 
+    # f_r * cos / pdf = (rho/pi) * cos / (cos/pi) = rho. The cosine and both
+    # pi terms cancel exactly, which is why this is a multiply and not a
+    # divide -- and why throughput is literally the product of albedos along
+    # the path, and must stay inside [0,1]^3 before Russian roulette.
     throughput *= brdf.sample_cosine_weighted_bounce(hit.albedo, cos_theta, vec3(1.0))
 
     if bounce >= RR_MIN_BOUNCES:
@@ -154,6 +143,6 @@ def path_trace(ray: Ray, brdf: ti.template(), triangles: ti.template(), num_tria
     prev_x = hit.position
     prev_p_bsdf = pdf_brdf
 
-    current_ray = Ray(origin=hit.position + shading_normal * RAY_OFFSET_EPSILON, direction=bounce_dir)
+    current_ray = Ray(origin=hit.position + shading_normal * RAY_ORIGIN_EPSILON, direction=bounce_dir)
 
   return radiance
