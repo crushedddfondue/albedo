@@ -26,7 +26,7 @@ def build_tangent_space(n: vec3):  # type: ignore
 
 
 @ti.func
-def path_trace(ray: Ray, brdf: ti.template(), triangles: ti.template(), num_triangles: ti.i32, bvh_node_min: ti.template(), bvh_node_max: ti.template(), bvh_node_left: ti.template(), bvh_node_right: ti.template(), bvh_node_start: ti.template(), bvh_node_count: ti.template(), bvh_indices: ti.template(), light_triangle_index: ti.template(), light_pdf_area: ti.template(), num_lights: ti.i32, single_sided: ti.i32, use_nee: ti.i32, max_bounces: ti.i32,):  # type: ignore
+def path_trace(ray: Ray, brdf: ti.template(), environment: ti.template(), triangles: ti.template(), num_triangles: ti.i32, bvh_node_min: ti.template(), bvh_node_max: ti.template(), bvh_node_left: ti.template(), bvh_node_right: ti.template(), bvh_node_start: ti.template(), bvh_node_count: ti.template(), bvh_indices: ti.template(), light_triangle_index: ti.template(), light_pdf_area: ti.template(), num_lights: ti.i32, single_sided: ti.i32, use_nee: ti.i32, max_bounces: ti.i32,):  # type: ignore
   radiance = vec3(0.0)
   throughput = vec3(1.0)
 
@@ -43,10 +43,13 @@ def path_trace(ray: Ray, brdf: ti.template(), triangles: ti.template(), num_tria
     )
 
     if hit.hit == 0:
-      # FOLLOW-UP: this is correct only for a black environment. Once
-      # tracer/environment.py exists the miss case becomes a contribution,
-      # radiance += throughput * L_env(current_ray.direction), which is also
-      # what makes the white furnace test possible.
+      # A ray that hits nothing is not carrying zero radiance -- it is
+      # carrying whatever the environment emits in that direction. The
+      # environment has direction but no position, so unlike an area light
+      # there is no distance falloff and no area-to-solid-angle conversion.
+      # With Environment(mode=ENV_BLACK) this reduces exactly to the previous
+      # bare `break`.
+      radiance += throughput * environment.sample(current_ray.direction)
       break
 
     # ---- Emission. Uses hit.normal, the TRUE geometric normal, deliberately:
