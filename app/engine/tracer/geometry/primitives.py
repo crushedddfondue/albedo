@@ -1,7 +1,7 @@
 import taichi as ti
 from taichi.math import vec3
 
-EPSILON = 1e-4
+from tracer.constants import TRIANGLE_DET_EPSILON
 
 
 Ray = ti.types.struct(origin=vec3, direction=vec3)
@@ -36,7 +36,7 @@ def ray_triangle_intersect(ray: Ray, triangle: Triangle, t_min: ti.f32, t_max: t
 
   record = HitRecord(hit=0, t=0.0, position=vec3(0.0), normal=vec3(0.0), albedo=vec3(0.0), light_index=-1, emission=vec3(0.0))
 
-  if ti.abs(det) > EPSILON:
+  if ti.abs(det) > TRIANGLE_DET_EPSILON:
     inv_det = 1.0 / det
     t_vec = ray.origin - triangle.v0
 
@@ -45,6 +45,9 @@ def ray_triangle_intersect(ray: Ray, triangle: Triangle, t_min: ti.f32, t_max: t
       q_vec = ti.math.cross(t_vec, edge1)
       v = ti.math.dot(ray.direction, q_vec) * inv_det
 
+      # u + v <= 1, not v <= 1. The latter describes the parallelogram spanned
+      # by edge1 and edge2 rather than the triangle, silently doubling the
+      # primitive. The deleted duplicate in traverse.py had exactly that error.
       if v >= 0.0 and (u + v) <= 1.0:
         t = ti.math.dot(edge2, q_vec) * inv_det
 
