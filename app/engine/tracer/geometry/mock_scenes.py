@@ -13,11 +13,11 @@ def _write_test_room():
   # silently disagree with the real geometry.
   scene.triangles[0] = scene.Triangle(
     v0=vec3(-5.0, 0.0, -5.0), v1=vec3(5.0, 0.0, 5.0), v2=vec3(5.0, 0.0, -5.0),
-    normal=vec3(0.0), albedo=vec3(0.8), emission=vec3(0.0), light_index=-1,
+    normal=vec3(0.0), albedo=vec3(0.8), emission=vec3(0.0), light_index=-1, object_id=0
   )
   scene.triangles[1] = scene.Triangle(
     v0=vec3(-5.0, 0.0, -5.0), v1=vec3(-5.0, 0.0, 5.0), v2=vec3(5.0, 0.0, 5.0),
-    normal=vec3(0.0), albedo=vec3(0.8), emission=vec3(0.0), light_index=-1,
+    normal=vec3(0.0), albedo=vec3(0.8), emission=vec3(0.0), light_index=-1, object_id=0
   )
 
   # Light quad (2 triangles), hovering at y=4, emission = 10.0 white.
@@ -25,10 +25,12 @@ def _write_test_room():
   scene.triangles[2] = scene.Triangle(
     v0=vec3(-1.0, 4.0, -1.0), v1=vec3(1.0, 4.0, -1.0), v2=vec3(1.0, 4.0, 1.0),
     normal=vec3(0.0), albedo=vec3(0.0), emission=vec3(10.0, 10.0, 10.0), light_index=-1,
+    object_id = 1
   )
   scene.triangles[3] = scene.Triangle(
     v0=vec3(-1.0, 4.0, -1.0), v1=vec3(1.0, 4.0, 1.0), v2=vec3(-1.0, 4.0, 1.0),
     normal=vec3(0.0), albedo=vec3(0.0), emission=vec3(10.0, 10.0, 10.0), light_index=-1,
+    object_id=1
   )
 
   # Occluder (2 triangles), y=2, albedo 0.8, non-emissive. Same winding as
@@ -37,11 +39,11 @@ def _write_test_room():
   # produce an actual tree rather than a single leaf node.
   scene.triangles[4] = scene.Triangle(
     v0=vec3(-0.75, 2.0, -0.75), v1=vec3(0.75, 2.0, 0.75), v2=vec3(0.75, 2.0, -0.75),
-    normal=vec3(0.0), albedo=vec3(0.8), emission=vec3(0.0), light_index=-1,
+    normal=vec3(0.0), albedo=vec3(0.8), emission=vec3(0.0), light_index=-1, object_id=2
   )
   scene.triangles[5] = scene.Triangle(
     v0=vec3(-0.75, 2.0, -0.75), v1=vec3(-0.75, 2.0, 0.75), v2=vec3(0.75, 2.0, 0.75),
-    normal=vec3(0.0), albedo=vec3(0.8), emission=vec3(0.0), light_index=-1,
+    normal=vec3(0.0), albedo=vec3(0.8), emission=vec3(0.0), light_index=-1, object_id=2
   )
 
   scene.num_triangles[None] = 6
