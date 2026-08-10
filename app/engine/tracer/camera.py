@@ -213,6 +213,28 @@ class Camera:
     p[3, 2] = -1.0
     return p
 
+  @ti.func
+  def ray_direction_for_pixel(px: ti.i32, py: ti.i32, jitter_x: ti.f32, jitter_y: ti.f32, width: ti.i32, height: ti.i32, right: vec3, up: vec3, forward: vec3, fov: ti.f32, aspect_ratio: ti.f32) -> vec3:  # type: ignore
+    """Single source of truth for the pixel -> ray mapping.
+
+    Previously duplicated in Camera.primary_ray_generation and
+    accumulate_kernel, and the two had already diverged on jitter. A G-buffer
+    generated from a different ray than the radiance is misaligned by a
+    sub-pixel offset, and every downstream filter inherits that error.
+
+    ndc_y uses the lower-left origin convention, matching ti.GUI.set_image.
+    """
+    scale_phi = ti.tan(fov / 2.0)
+
+    ndc_x = 2.0 * ((ti.cast(px, ti.f32) + jitter_x) / ti.cast(width, ti.f32)) - 1.0
+    ndc_y = 2.0 * ((ti.cast(py, ti.f32) + jitter_y) / ti.cast(height, ti.f32)) - 1.0
+
+    return normalize(
+      ndc_x * aspect_ratio * scale_phi * right +
+      ndc_y * scale_phi * up +
+      forward
+    )
+
   # To generate primary rays for ray tracing
   @ti.kernel
   def primary_ray_generation(self, right: vec3, up: vec3, forward: vec3, position: vec3, fov: ti.f32, aspect_ratio: ti.f32, ray_o: ti.template(), ray_d: ti.template(),): # type: ignore
