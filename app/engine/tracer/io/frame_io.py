@@ -2,17 +2,13 @@ import os
 import json
 import numpy as np
 
-# =============================================================================
-# Constants & Conventions
-# =============================================================================
-
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 CONVENTIONS = {
   "ndc_y": "lower-left",
   "normal_space": "world",
   "normal_facing": "viewer-facing",
-  "depth_rep": "TBD",   # Update once the depth representation is decided
+  "depth_rep": "view_space_z_linear",   # Update once the depth representation is decided
   "layout": "WHC",      # Native Taichi layout (Width, Height, Channels)
 }
 
