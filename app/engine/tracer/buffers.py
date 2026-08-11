@@ -1,16 +1,17 @@
+from typing import Any
+
 import taichi as ti
 from taichi.math import vec3, vec2
-
 
 width = 0
 height = 0
 
-albedo = None
-normal = None
-object_id = None
-hit_mask = None
-depth = None
-motion = None
+albedo: Any = None
+normal: Any = None
+object_id: Any = None
+hit_mask: Any = None
+depth: Any = None
+motion: Any = None
 
 
 def init_aov_fields(w: int, h: int):
