@@ -1,3 +1,5 @@
+import numpy as np
+
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -88,11 +90,27 @@ def render_mode_hit_mask():
 
 
 @ti.kernel
-def render_mode_depth():
-  # Stub until the depth representation is decided. Writes both branches so
-  # switching to this mode does not leave the previous mode's pixels behind.
+def _depth_kernel(d_min: ti.f32, d_range: ti.f32):  # type: ignore
   for i, j in display:
-    display[i, j] = vec3(0.0)
+    if buffers.hit_mask[i, j] == 1:
+      t = (buffers.depth[i, j] - d_min) / d_range
+      display[i, j] = vec3(ti.math.clamp(t, 0.0, 1.0))
+    else:
+      display[i, j] = vec3(0.0)
+
+@ti.kernel
+def render_mode_depth():
+  d = buffers.depth.to_numpy()
+  hit = buffers.hit_mask.to_numpy() == 1
+
+  if not hit.any():
+    _depth_kernel(0.0, 1.0)
+    return 
+
+  d_min = float(d[hit].min())
+  d_max = float(d[hit].max())
+  print(f"depth range: {d_min:.3f} .. {d_max:.3f}")
+  _depth_kernel(d_min, max(d_max - d_min, 1e-6))
 
 
 RENDERERS = {
@@ -134,15 +152,24 @@ def main():
   # Static camera, so once is enough. If camera controls are added,
   # clear_aovs() then gbuffer_kernel() on every move, in that order -- the
   # miss branch deliberately does not write albedo/normal, so stale values
-  # would survive in background pixels.
+  # would survive in background pixels
   gbuffer_kernel(
-    buffers.albedo, buffers.normal, buffers.object_id, buffers.hit_mask,
-    right, up, forward, camera.position,
-    camera.fov, camera.aspect_ratio,
-    scene.triangles,
-    builder.bvh_node_min, builder.bvh_node_max,
-    builder.bvh_node_left, builder.bvh_node_right,
-    builder.bvh_node_start, builder.bvh_node_count, builder.bvh_indices,
+    albedo_f=buffers.albedo,
+    normal_f=buffers.normal,
+    object_id_f=buffers.object_id,
+    hit_mask_f=buffers.hit_mask,
+    depth_f=buffers.depth,
+    right=right, up=up, forward=forward,
+    position=camera.position,
+    fov=camera.fov, aspect_ratio=camera.aspect_ratio,
+    triangles=scene.triangles,
+    bvh_node_min=builder.bvh_node_min,
+    bvh_node_max=builder.bvh_node_max,
+    bvh_node_left=builder.bvh_node_left,
+    bvh_node_right=builder.bvh_node_right,
+    bvh_node_start=builder.bvh_node_start,
+    bvh_node_count=builder.bvh_node_count,
+    bvh_indices=builder.bvh_indices
   )
 
   gui = ti.GUI("AOV Viewer", res=(WIDTH, HEIGHT))  # type: ignore
