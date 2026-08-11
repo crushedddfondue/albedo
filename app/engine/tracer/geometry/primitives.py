@@ -27,7 +27,7 @@ def compute_triangle_normal(triangle: Triangle) -> vec3:  # type: ignore
 
 
 @ti.func
-def ray_triangle_intersect(ray: Ray, triangle: Triangle, t_min: ti.f32, t_max: ti.f32, object_id: ti.i32) -> HitRecord:  # type: ignore
+def ray_triangle_intersect(ray: Ray, triangle: Triangle, t_min: ti.f32, t_max: ti.f32) -> HitRecord:  # type: ignore
   edge1 = triangle.v1 - triangle.v0
   edge2 = triangle.v2 - triangle.v0
 
