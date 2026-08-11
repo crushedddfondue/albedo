@@ -7,7 +7,7 @@ from tracer.bvh.aabb import AABB, ray_aabb_intersection
 
 
 @ti.func
-def compute_visibility(x: vec3, n: vec3, x_l: vec3, dist_to_light: ti.f32, bvh_node_min: ti.template(), bvh_node_max: ti.template(), bvh_node_left: ti.template(), bvh_node_right: ti.template(), bvh_node_start: ti.template(), bvh_node_count: ti.template(), bvh_indices: ti.template(), triangles: ti.template(), object_id: ti.template()) -> ti.f32:  # type: ignore
+def compute_visibility(x: vec3, n: vec3, x_l: vec3, dist_to_light: ti.f32, bvh_node_min: ti.template(), bvh_node_max: ti.template(), bvh_node_left: ti.template(), bvh_node_right: ti.template(), bvh_node_start: ti.template(), bvh_node_count: ti.template(), bvh_indices: ti.template(), triangles: ti.template()) -> ti.f32:  # type: ignore
   ray_o = x + n * RAY_ORIGIN_EPSILON
   ray_d = normalize(x_l - x)
 
@@ -18,7 +18,7 @@ def compute_visibility(x: vec3, n: vec3, x_l: vec3, dist_to_light: ti.f32, bvh_n
   occluded = traverse_any_hit(
     ray_o, ray_d, t_max,
     bvh_node_min, bvh_node_max, bvh_node_left, bvh_node_right,
-    bvh_node_start, bvh_node_count, bvh_indices, triangles, object_id
+    bvh_node_start, bvh_node_count, bvh_indices, triangles
   )
 
   visibility = 1.0
@@ -29,7 +29,7 @@ def compute_visibility(x: vec3, n: vec3, x_l: vec3, dist_to_light: ti.f32, bvh_n
 
 
 @ti.func
-def traverse_closest_hit(ray_o: vec3, ray_d: vec3, bvh_node_min: ti.template(), bvh_node_max: ti.template(), bvh_node_left: ti.template(), bvh_node_right: ti.template(), bvh_node_start: ti.template(), bvh_node_count: ti.template(), bvh_indices: ti.template(), triangles: ti.template(), object_id: ti.template()) -> HitRecord:  # type: ignore
+def traverse_closest_hit(ray_o: vec3, ray_d: vec3, bvh_node_min: ti.template(), bvh_node_max: ti.template(), bvh_node_left: ti.template(), bvh_node_right: ti.template(), bvh_node_start: ti.template(), bvh_node_count: ti.template(), bvh_indices: ti.template(), triangles: ti.template()) -> HitRecord:  # type: ignore
   inv_dir = 1.0 / ray_d
   t_min = RAY_T_MIN
   closest_t = 1e9
@@ -55,7 +55,7 @@ def traverse_closest_hit(ray_o: vec3, ray_d: vec3, bvh_node_min: ti.template(), 
       start = bvh_node_start[node_idx]
       for i in range(start, start + count):
         tri_idx = bvh_indices[i]
-        candidate = ray_triangle_intersect(ray, triangles[tri_idx], t_min, closest_t, object_id)
+        candidate = ray_triangle_intersect(ray, triangles[tri_idx], t_min, closest_t)
         if candidate.hit == 1:
           closest = candidate
           closest_t = candidate.t
@@ -76,7 +76,7 @@ def traverse_closest_hit(ray_o: vec3, ray_d: vec3, bvh_node_min: ti.template(), 
 
 
 @ti.func
-def traverse_any_hit(ray_o: vec3, ray_d: vec3, t_max: ti.f32, bvh_node_min: ti.template(), bvh_node_max: ti.template(), bvh_node_left: ti.template(), bvh_node_right: ti.template(), bvh_node_start: ti.template(), bvh_node_count: ti.template(), bvh_indices: ti.template(), triangles: ti.template(), object_id: ti.template()) -> ti.i32:  # type: ignore
+def traverse_any_hit(ray_o: vec3, ray_d: vec3, t_max: ti.f32, bvh_node_min: ti.template(), bvh_node_max: ti.template(), bvh_node_left: ti.template(), bvh_node_right: ti.template(), bvh_node_start: ti.template(), bvh_node_count: ti.template(), bvh_indices: ti.template(), triangles: ti.template()) -> ti.i32:  # type: ignore
   inv_dir = 1.0 / ray_d
   t_min = RAY_T_MIN
   ray = Ray(origin=ray_o, direction=ray_d)
@@ -100,7 +100,7 @@ def traverse_any_hit(ray_o: vec3, ray_d: vec3, t_max: ti.f32, bvh_node_min: ti.t
       start = bvh_node_start[node_idx]
       for i in range(start, start + count):
         tri_idx = bvh_indices[i]
-        candidate = ray_triangle_intersect(ray, triangles[tri_idx], t_min, t_max, object_id)
+        candidate = ray_triangle_intersect(ray, triangles[tri_idx], t_min, t_max)
         if candidate.hit == 1:
           occluded = 1
           break
