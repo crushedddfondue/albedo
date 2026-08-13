@@ -14,6 +14,8 @@ from tracer.geometry import scene
 from tracer.geometry.mock_scenes import build_test_room, build_furnace_scene
 from tracer.bvh import builder
 
+print(np.load("nee.npy")[:, :250].mean())
+
 WIDTH = 1280
 HEIGHT = 720
 
