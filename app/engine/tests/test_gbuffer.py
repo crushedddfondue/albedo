@@ -8,6 +8,7 @@ from taichi.math import vec3
 
 from tracer import buffers
 from tracer.camera import Camera
+from tracer.constants import BACKGROUND_DEPTH
 from tracer.geometry import scene
 from tracer.geometry.mock_scenes import build_test_room, build_furnace_scene
 from tracer.bvh import builder
@@ -18,23 +19,25 @@ from tracer.environment import Environment, ENV_CONSTANT
 
 W, H = 320, 180   # small: these tests are about correctness, not throughput
 
+# Known surface heights, keyed by object_id. The reconstruction test checks
+# depth against these.
+SURFACE_Y = {0: 0.0, 1: 4.0, 2: 2.0}
+
 
 @ti.kernel
-def _facing_kernel(facing: ti.template(), normal_f: ti.template(), hit_mask_f: ti.template(), right: vec3, up: vec3, forward: vec3, fov: ti.f32, aspect_ratio: ti.f32):  # type: ignore
-  """dot(n, -ray_dir) per pixel.
+def _ray_dir_kernel(dirs: ti.template(), right: vec3, up: vec3, forward: vec3, fov: ti.f32, aspect_ratio: ti.f32):  # type: ignore
+  """Primary ray direction per pixel, at pixel centre.
 
   Deliberately calls the same ray_direction_for_pixel that gbuffer_kernel
-  uses, so this doubles as a check that the shared function is actually
-  shared -- if someone reintroduces a second copy of the mapping, the dot
-  products drift and this fails.
+  uses. If someone reintroduces a second copy of the pixel -> ray mapping,
+  every test built on these directions drifts and fails.
   """
-  width = normal_f.shape[0]
-  height = normal_f.shape[1]
-  for px, py in normal_f:
-    facing[px, py] = 0.0
-    if hit_mask_f[px, py] == 1:
-      d = Camera.ray_direction_for_pixel(px, py, 0.5, 0.5, width, height, right, up, forward, fov, aspect_ratio)
-      facing[px, py] = ti.math.dot(normal_f[px, py], -d)
+  width = dirs.shape[0]
+  height = dirs.shape[1]
+  for px, py in dirs:
+    dirs[px, py] = Camera.ray_direction_for_pixel(
+      px, py, 0.5, 0.5, width, height, right, up, forward, fov, aspect_ratio
+    )
 
 
 @pytest.fixture(scope="module")
@@ -48,12 +51,13 @@ def frame():
     fov=math.radians(60.0), aspect_ratio=W / H, near=0.1, far=1000.0,
   )
   right, up, forward = camera.basis_from_yaw_pitch()
-  facing = ti.field(ti.f32, shape=(W, H))
+  dirs_field = ti.Vector.field(3, ti.f32, shape=(W, H))
 
   def render():
     buffers.clear_aovs()
     gbuffer_kernel(
-      buffers.albedo, buffers.normal, buffers.object_id, buffers.hit_mask,
+      buffers.albedo, buffers.normal, buffers.object_id,
+      buffers.hit_mask, buffers.depth,
       right, up, forward, camera.position, camera.fov, camera.aspect_ratio,
       scene.triangles,
       builder.bvh_node_min, builder.bvh_node_max,
@@ -62,15 +66,21 @@ def frame():
     )
 
   render()
-  _facing_kernel(facing, buffers.normal, buffers.hit_mask,
-                 right, up, forward, camera.fov, camera.aspect_ratio)
+  _ray_dir_kernel(dirs_field, right, up, forward, camera.fov, camera.aspect_ratio)
+
+  dirs = dirs_field.to_numpy()
+  normal = buffers.normal.to_numpy()
 
   return SimpleNamespace(
     albedo=buffers.albedo.to_numpy(),
-    normal=buffers.normal.to_numpy(),
+    normal=normal,
     object_id=buffers.object_id.to_numpy(),
     hit_mask=buffers.hit_mask.to_numpy(),
-    facing=facing.to_numpy(),
+    depth=buffers.depth.to_numpy(),
+    dirs=dirs,
+    facing=-(normal * dirs).sum(axis=-1),
+    origin=np.asarray(camera.position, dtype=np.float64),
+    forward=np.asarray(forward, dtype=np.float64),
     camera=camera, basis=(right, up, forward), render=render,
   )
 
@@ -107,11 +117,44 @@ def test_object_ids_are_known(frame):
 
 
 def test_background_channels_untouched(frame):
-  """The miss branch deliberately does not write albedo or normal, so these
-  must still hold whatever clear_aovs() set. Catches a stale buffer."""
+  """The miss branch deliberately does not write albedo, normal or depth, so
+  these must still hold whatever clear_aovs() set. Catches a stale buffer."""
   bg = frame.hit_mask == 0
   assert np.all(frame.albedo[bg] == 0.0)
   assert np.all(frame.normal[bg] == 0.0)
+  assert np.all(frame.depth[bg] == np.float32(BACKGROUND_DEPTH))
+
+
+def test_depth_is_positive(frame):
+  hit = frame.hit_mask == 1
+  assert (frame.depth[hit] > 0.0).all()
+
+
+def test_depth_reconstructs_known_geometry(frame):
+  """Exact check on the depth channel, not a statistical one.
+
+  Depth is view-space z, so ray distance is t = z / dot(d, forward) and the
+  hit position is origin + t*d. Every surface in the test room sits at a
+  known height, so the reconstructed y must match it.
+
+  This is the test that distinguishes view-space z from ray distance. If
+  ray distance were stored, dividing by the cosine overshoots and the
+  reconstructed floor bows upward toward the frame edges -- which is
+  precisely the artefact that would make SVGF treat a flat floor as curved.
+  """
+  hit = frame.hit_mask == 1
+  cos = frame.dirs.astype(np.float64) @ frame.forward
+  t = np.where(hit, frame.depth / cos, 0.0)
+  pos = frame.origin + t[..., None] * frame.dirs.astype(np.float64)
+
+  for obj_id, expected_y in SURFACE_Y.items():
+    sel = frame.object_id == obj_id
+    assert sel.any(), f"object_id {obj_id} not visible; the test camera moved"
+    worst = np.abs(pos[..., 1][sel] - expected_y).max()
+    assert worst < 1e-3, (
+      f"object_id {obj_id} should reconstruct to y={expected_y}, "
+      f"worst error {worst:.2e}"
+    )
 
 
 def test_downward_facing_surfaces_share_a_normal(frame):
@@ -129,10 +172,11 @@ def test_deterministic(frame):
   """Zero ti.random calls anywhere in the G-buffer path, so re-rendering must
   be bit-identical. Anything else means a bug or an unzeroed buffer."""
   before = (frame.albedo.copy(), frame.normal.copy(),
-            frame.object_id.copy(), frame.hit_mask.copy())
+            frame.object_id.copy(), frame.hit_mask.copy(), frame.depth.copy())
   frame.render()
   after = (buffers.albedo.to_numpy(), buffers.normal.to_numpy(),
-           buffers.object_id.to_numpy(), buffers.hit_mask.to_numpy())
+           buffers.object_id.to_numpy(), buffers.hit_mask.to_numpy(),
+           buffers.depth.to_numpy())
   for b, a in zip(before, after):
     assert np.array_equal(b, a)
 
@@ -161,7 +205,8 @@ def test_silhouette_matches_path_tracer():
 
   buffers.clear_aovs()
   gbuffer_kernel(
-    buffers.albedo, buffers.normal, buffers.object_id, buffers.hit_mask,
+    buffers.albedo, buffers.normal, buffers.object_id,
+    buffers.hit_mask, buffers.depth,
     right, up, forward, camera.position, camera.fov, camera.aspect_ratio,
     scene.triangles,
     builder.bvh_node_min, builder.bvh_node_max,
