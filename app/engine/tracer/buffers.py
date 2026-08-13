@@ -3,6 +3,13 @@ from typing import Any
 import taichi as ti
 from taichi.math import vec3, vec2
 
+from tracer.constants import BACKGROUND_DEPTH
+
+# Allocated by init_aov_fields(), which must run after ti.init().
+#
+# Consumers: use `from tracer import buffers` and reference buffers.albedo.
+# A `from tracer.buffers import albedo` snapshots None at import time and
+# never sees the reassignment below.
 width = 0
 height = 0
 
@@ -15,8 +22,27 @@ motion: Any = None
 
 
 def init_aov_fields(w: int, h: int):
+  """Allocate the AOV set. Idempotent.
+
+  ⚠ Re-allocation cannot be allowed silently. Any @ti.kernel reading these
+  module globals is permanently bound to whatever they pointed at when that
+  kernel first compiled. Rebinding the names afterwards is invisible to the
+  kernel and visible to Python, and the two views then disagree forever.
+
+  Allocate once, return early if already done, raise if someone asks for a
+  different shape rather than silently handing back the old one.
+  """
   global width, height
   global albedo, normal, object_id, hit_mask, depth, motion
+
+  if albedo is not None:
+    if (width, height) != (w, h):
+      raise RuntimeError(
+        f"AOV fields already allocated at {width}x{height}; cannot reallocate "
+        f"to {w}x{h}. Kernels compiled against the old fields would keep "
+        f"writing to them."
+      )
+    return
 
   width = w
   height = h
@@ -39,17 +65,17 @@ def _clear_kernel(albedo_f: ti.template(), normal_f: ti.template(), object_id_f:
     normal_f[i, j] = vec3(0.0)
     object_id_f[i, j] = -1
     hit_mask_f[i, j] = 0
-    # NOTE: 0.0 is a placeholder sentinel. Decide alongside the depth
-    # representation -- zero is a plausible depth in some conventions, so
-    # either use a large sentinel or make hit_mask the sole authority and
-    # attach no meaning to background depth.
-    depth_f[i, j] = 0.0
+    # Huge sentinel, not zero. hit_mask is the authority, but bilinear
+    # history fetches in 2.2 will straddle silhouette edges and pick up
+    # background taps. Zero reads as "very close" and could wrongly pass a
+    # depth rejection test; a huge value reads as "infinitely far" and fails
+    # it. Fail-safe direction.
+    depth_f[i, j] = BACKGROUND_DEPTH
     motion_f[i, j] = vec2(0.0)
 
 
 def clear_aovs():
-  """Python-scope wrapper. Reads the module globals at call time, so a
-  reallocation (window resize) is picked up automatically -- Taichi
-  recompiles the kernel when the ti.template() arguments change identity.
-  Call sites stay one word long."""
+  """Python-scope wrapper. Resolves the module globals at call time and
+  passes them as ti.template() arguments, so the kernel is never bound to a
+  stale field. Call sites stay one word long."""
   _clear_kernel(albedo, normal, object_id, hit_mask, depth, motion)
