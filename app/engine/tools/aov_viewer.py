@@ -98,7 +98,6 @@ def _depth_kernel(d_min: ti.f32, d_range: ti.f32):  # type: ignore
     else:
       display[i, j] = vec3(0.0)
 
-@ti.kernel
 def render_mode_depth():
   d = buffers.depth.to_numpy()
   hit = buffers.hit_mask.to_numpy() == 1
