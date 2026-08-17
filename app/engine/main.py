@@ -2,146 +2,195 @@ import math
 
 import numpy as np
 import taichi as ti
+from taichi.math import vec3
 
-from tracer.camera import Camera
-from tracer.sampling.brdf import BRDF
-from tracer.environment import Environment, ENV_BLACK, ENV_GRADIENT, ENV_CONSTANT
-from tracer.kernels.render import (
-  accumulate_kernel, resolve_kernel,
-  TONEMAP_NONE, TONEMAP_REINHARD, TONEMAP_REINHARD_EXT,
-)
-from tracer.geometry import scene
-from tracer.geometry.mock_scenes import build_test_room, build_furnace_scene
+from tracer import buffers
 from tracer.bvh import builder
+from tracer.camera import Camera
+from tracer.camera_path import scripted
+from tracer.denoise import history
+from tracer.denoise.demodulate import demodulate, remodulate
+from tracer.denoise.reproject import reproject_kernel
+from tracer.environment import Environment, ENV_BLACK
+from tracer.geometry import scene
+from tracer.geometry.mock_scenes import build_test_room
+from tracer.kernels.gbuffer import gbuffer_kernel
+from tracer.kernels.motion import motion_kernel
+from tracer.kernels.render import (
+  accumulate_kernel, resolve_kernel, TONEMAP_REINHARD_EXT,
+)
+from tracer.sampling.brdf import BRDF
 
-print(np.load("nee.npy")[:, :250].mean())
-
-WIDTH = 1280
-HEIGHT = 720
+WIDTH, HEIGHT = 1280, 720
 
 FOV = 60.0
-NEAR = 0.1
-FAR = 1000.0
+NEAR, FAR = 0.1, 1000.0
+PITCH = math.radians(5)
 
 MAX_BOUNCES = 8
 
-# SPP is now samples per FRAME, not per image. Total samples = SPP * frames.
-# Keep it small: the point of accumulation is many cheap launches rather than
-# one expensive one, which is also what keeps each launch under the Windows
-# TDR limit.
-SPP = 4
+# ⚠ SPP is now samples per frame with NO cross-frame accumulation. The
+# denoiser's whole job is to make a noisy per-frame estimate usable, so
+# feeding it a progressively-converged image would be testing nothing.
+# accumulate_kernel is called with frame_index=1 every frame, which makes
+# its running mean reduce to a plain assignment.
+SPP = 2
 
 USE_NEE = 1
 SINGLE_SIDED = 1
 
-# Display. Nothing here touches the linear accumulation buffer.
+# Caps how far back history reaches. 0.05 is roughly a 20-frame window.
+# Larger means less noise and more ghosting -- this one number is the entire
+# temporal quality tradeoff.
+ALPHA_MIN = 0.05
+
+# A camera jump larger than this invalidates all history.
+CUT_DISTANCE = 0.5
+
 EXPOSURE = 1.0
 TONEMAP = TONEMAP_REINHARD_EXT
 WHITE_POINT = 3.0
 
-# ---- Offline / validation mode ----------------------------------------------
-# When OFFLINE is True, run a fixed number of frames, report, and stop
-# accumulating. When False, accumulate indefinitely and watch it converge.
-OFFLINE = True
-OFFLINE_FRAMES = 256          # 256 * 4 = 1024 spp total
 
-# White furnace test. Constant environment radiance, unit albedo, no emitters.
-#     L_o = (rho/pi) * L * int_H cos(theta) dw = rho * L = L   for rho = 1
-# The accumulation buffer is linear now, so this reads it directly -- no
-# ** 2.2 round trip, and it stays valid even for values above 1.0.
-FURNACE = False
-FURNACE_L = 0.5
+def make_camera(position, yaw):
+  return Camera(
+    position=position, yaw=yaw, pitch=PITCH,
+    fov=math.radians(FOV), aspect_ratio=WIDTH / HEIGHT,
+    near=NEAR, far=FAR,
+  )
 
 
 def main():
   ti.init(arch=ti.cuda)
 
+  print("init ok")
+
   scene.init_scene_fields()
+  build_test_room()
+  print("scene ok")
 
-  if FURNACE:
-    build_furnace_scene()
-    environment = Environment(mode=ENV_CONSTANT, constant=ti.math.vec3(FURNACE_L))
-  else:
-    build_test_room()
-    environment = Environment(mode=ENV_BLACK)
+  buffers.init_aov_fields(WIDTH, HEIGHT)
+  history.init_history_fields(WIDTH, HEIGHT)
+  history.reset()
+  print("buffers ok")
 
-  # Cheap guard against rendering a scene that silently did not change --
-  # e.g. occluder triangles written but num_triangles left at 4. Expect
-  # 6 triangles / 3 nodes; 6 against LEAF_SIZE = 4 forces build() to recurse.
-  print(f"triangles: {scene.num_triangles[None]}  bvh nodes: {len(builder.nodes)}  lights: {scene.num_lights[None]}")
+  scene.init_scene_fields()
+  build_test_room()
+  buffers.init_aov_fields(WIDTH, HEIGHT)
+  history.init_history_fields(WIDTH, HEIGHT)
+  history.reset()
 
-  camera = Camera(
-    position=ti.math.vec3(0.0, 1.2, 4.0),
-    yaw=0.0,
-    pitch=math.radians(5),
-    fov=math.radians(FOV),
-    aspect_ratio=WIDTH / HEIGHT,
-    near=NEAR,
-    far=FAR,
-  )
-
-  right, up, forward = camera.basis_from_yaw_pitch()
+  print(f"triangles: {scene.num_triangles[None]}  bvh nodes: {len(builder.nodes)}  "
+        f"lights: {scene.num_lights[None]}")
 
   brdf = BRDF()
+  environment = Environment(mode=ENV_BLACK)
 
-  # accum holds linear HDR radiance and is the tracer's real output.
-  # display is display-referred [0,1] and exists only for ti.GUI.
-  accum = ti.Vector.field(3, dtype=ti.f32, shape=(WIDTH, HEIGHT))
-  display = ti.Vector.field(3, dtype=ti.f32, shape=(WIDTH, HEIGHT))
-  accum.fill(0.0)
+  shape = (WIDTH, HEIGHT)
+  raw = ti.Vector.field(3, ti.f32, shape=shape)        # noisy radiance, linear
+  demod = ti.Vector.field(3, ti.f32, shape=shape)      # radiance / albedo
+  accum_col = ti.Vector.field(3, ti.f32, shape=shape)  # temporally accumulated
+  accum_mom = ti.Vector.field(2, ti.f32, shape=shape)
+  accum_len = ti.field(ti.i32, shape=shape)
+  final = ti.Vector.field(3, ti.f32, shape=shape)      # remodulated
+  display = ti.Vector.field(3, ti.f32, shape=shape)
 
-  def trace(frame_index):
+  gui = ti.GUI("Project Albedo", res=(WIDTH, HEIGHT))  # type: ignore
+
+  frame = 0
+  prev = None   # (view, proj, position) of the previous frame
+
+  while gui.running:
+    position, yaw = scripted(frame)
+    camera = make_camera(position, yaw)
+    right, up, forward = camera.basis_from_yaw_pitch()
+
+    # A teleport invalidates every pixel's history. Detected by distance
+    # rather than by frame number so it also catches the discontinuity where
+    # the scripted path switches phases.
+    if prev is not None:
+      if float(np.linalg.norm(np.asarray(position) - prev[2])) > CUT_DISTANCE:
+        history.reset()
+        prev = None
+
+    # --- 1. G-buffer. clear_aovs FIRST: the miss branch deliberately leaves
+    #        albedo, normal and depth alone, so stale background survives.
+    buffers.clear_aovs()
+    gbuffer_kernel(
+      buffers.albedo, buffers.normal, buffers.object_id,
+      buffers.hit_mask, buffers.depth,
+      right, up, forward, camera.position, camera.fov, camera.aspect_ratio,
+      scene.triangles,
+      builder.bvh_node_min, builder.bvh_node_max,
+      builder.bvh_node_left, builder.bvh_node_right,
+      builder.bvh_node_start, builder.bvh_node_count, builder.bvh_indices,
+    )
+
+    # --- 2. Motion vectors: current geometry, PREVIOUS matrices.
+    if prev is not None:
+      motion_kernel(
+        buffers.motion, buffers.depth, buffers.hit_mask,
+        right, up, forward, camera.position, camera.fov, camera.aspect_ratio,
+        prev[0], prev[1],
+      )
+    else:
+      buffers.motion.fill(0.0)
+
+    # --- 3. Noisy radiance. frame_index=1 makes the running mean a plain
+    #        assignment -- one independent estimate per frame.
     accumulate_kernel(
-      accum, frame_index,
-      right, up, forward, camera.position,
+      raw, 1, right, up, forward, camera.position,
       camera.fov, camera.aspect_ratio,
       brdf, environment,
       scene.triangles, scene.num_triangles[None],
-      builder.bvh_node_min, builder.bvh_node_max, builder.bvh_node_left, builder.bvh_node_right,
+      builder.bvh_node_min, builder.bvh_node_max,
+      builder.bvh_node_left, builder.bvh_node_right,
       builder.bvh_node_start, builder.bvh_node_count, builder.bvh_indices,
       scene.light_triangle_index, scene.light_pdf_area, scene.num_lights[None],
       SINGLE_SIDED, USE_NEE, MAX_BOUNCES, SPP,
     )
 
-  gui = ti.GUI("Project Albedo", res=(WIDTH, HEIGHT))  # type: ignore
+    # --- 4. Demodulate, so the filter sees irradiance not texture.
+    demodulate(raw, buffers.albedo, buffers.hit_mask, demod)
 
-  frame = 0
+    # --- 5. Temporal accumulation.
+    reproject_kernel(
+      demod, buffers.depth, buffers.normal, buffers.object_id, buffers.motion,
+      history.colour, history.moments, history.depth, history.normal,
+      history.object_id, history.length,
+      accum_col, accum_mom, accum_len,
+      WIDTH, HEIGHT, ALPHA_MIN,
+    )
 
-  if OFFLINE:
-    for f in range(1, OFFLINE_FRAMES + 1):
-      trace(f)
-    frame = OFFLINE_FRAMES
+    # --- 6. TODO: variance from accum_mom, then the a-trous spatial filter.
+    #        Until those exist this is temporal-only denoising, which is
+    #        still worth looking at -- it should visibly stabilise a static
+    #        camera and ghost under motion.
 
-    lin = accum.to_numpy().astype(np.float64)
+    # --- 7. Remodulate BEFORE display, but store the DEMODULATED result.
+    remodulate(accum_col, buffers.albedo, buffers.hit_mask, final)
 
-    if FURNACE:
-      err = np.abs(lin - FURNACE_L)
-      print(f"furnace  bounces {MAX_BOUNCES}  spp {SPP * OFFLINE_FRAMES}  "
-            f"min {lin.min():.6f}  max {lin.max():.6f}  mean {lin.mean():.6f}  target {FURNACE_L}")
-      print(f"         max abs error {err.max():.3e}   mean abs error {err.mean():.3e}")
-    else:
-      # Linear now, so the comparison script no longer needs ** 2.2.
-      np.save("nee.npy" if USE_NEE else "bsdf.npy", lin)
-      print(f"saved {'nee' if USE_NEE else 'bsdf'}.npy  spp {SPP * OFFLINE_FRAMES}  "
-            f"min {lin.min():.6f}  max {lin.max():.6f}  mean {lin.mean():.6f}")
+    # --- 8. History takes the FILTERED, demodulated colour. Storing the raw
+    #        input would average noise into noise and never converge.
+    history.store(
+      buffers.normal, buffers.object_id, buffers.depth,
+      accum_col, accum_mom, accum_len,
+    )
 
-  resolve_kernel(accum, display, EXPOSURE, TONEMAP, WHITE_POINT)
+    prev = (
+      np.asarray(camera.view_matrix(), dtype=np.float32),
+      np.asarray(camera.projection_matrix(), dtype=np.float32),
+      np.asarray(position, dtype=np.float64),
+    )
 
-  while gui.running:
-    if not OFFLINE:
-      # Progressive: one launch per displayed frame, converging live.
-      # Resetting on camera motion is frame = 0 plus accum.fill(0.0) --
-      # that hookup belongs with Task 6, when input actually moves the camera.
-      frame += 1
-      trace(frame)
-      resolve_kernel(accum, display, EXPOSURE, TONEMAP, WHITE_POINT)
-      gui.set_image(display)
-      gui.show(None)
-      if frame % 32 == 0:
-        print(f"frame {frame}  spp {frame * SPP}")
-    else:
-      gui.set_image(display)
-      gui.show()
+    resolve_kernel(final, display, EXPOSURE, TONEMAP, WHITE_POINT)
+    gui.set_image(display)
+    gui.show()
+
+    frame += 1
+    if frame % 60 == 0:
+      print(f"frame {frame}  mean history length "
+            f"{accum_len.to_numpy().mean():.1f}")
 
 
 if __name__ == "__main__":
