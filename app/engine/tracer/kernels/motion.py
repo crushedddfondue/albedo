@@ -7,7 +7,7 @@ from tracer.constants import EMISSION_FACING_EPSILON
 mat4 = ti.types.matrix(4, 4, ti.f32)
 
 @ti.kernel
-def motion_kernel(motion_f: ti.template(), depth_f: ti.template(), hit_mask_f: ti.template(), right, vec3, up: vec3, forward: vec3, position: mat4, fov: ti.f32, aspect_ratio: ti.f32, prev_view: mat4, prev_proj: mat4): # type: ignore
+def motion_kernel(motion_f: ti.template(), depth_f: ti.template(), hit_mask_f: ti.template(), right: vec3, up: vec3, forward: vec3, position: vec3, fov: ti.f32, aspect_ratio: ti.f32, prev_view: mat4, prev_proj: mat4): # type: ignore
   width = motion_f.shape[0]
   height = motion_f.shape[1]
 
