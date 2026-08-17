@@ -13,7 +13,7 @@ def demodulate(radiance: ti.template(), albedo: ti.template(), hit_mask: ti.temp
       out[i, j] = radiance[i, j]
 
 @ti.kernel
-def modulate(filtered: ti.template(), albedo: ti.template(), hit_mask: ti.template(), out: ti.template()):  # type: ignore
+def remodulate(filtered: ti.template(), albedo: ti.template(), hit_mask: ti.template(), out: ti.template()):  # type: ignore
   for i, j in filtered:
     if hit_mask[i, j] == 1:
       a = ti.max(albedo[i, j], vec3(DEMOD_EPS))
