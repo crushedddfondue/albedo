@@ -28,3 +28,7 @@ archive.txt
 
 # Numpy Files
 *.npy
+*.npz
+
+# results
+results/
