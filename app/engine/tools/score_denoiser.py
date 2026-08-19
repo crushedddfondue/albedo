@@ -10,6 +10,7 @@ import taichi as ti
 from taichi.math import vec3
 
 from metrics.image_metrics import report
+from metrics.results import log_result
 from tracer import buffers
 from tracer.bvh import builder
 from tracer.camera import Camera
@@ -131,16 +132,29 @@ def main():
   print(f"\nSVGF at {SPP} spp/frame, {WARMUP_FRAMES} frames warmup")
   print(f"reference own sigma: {sigma_ref:.6f}\n")
 
-  # ⚠ Both scores use the SAME metric code as 2.4 will. That is the only
-  # thing making the eventual comparison meaningful.
-  print("raw (no denoising):")
-  for k, v in report(one_spp, reference, mask=geo).items():
-    print(f"  {k:14s} {v:.6f}")
-
-  print("\nSVGF:")
+  raw_scores = report(one_spp, reference, mask=geo)
   svgf_scores = report(denoised, reference, mask=geo)
-  for k, v in svgf_scores.items():
-    print(f"  {k:14s} {v:.6f}")
+
+  ref_meta = {
+    "path": REFERENCE_PATH,
+    "spp_total": ref["meta"]["render_config"]["spp_total"],
+    "split_half_sigma": sigma_ref,
+  }
+  shared_config = {
+    "spp_per_frame": SPP, "max_bounces": MAX_BOUNCES,
+    "use_nee": USE_NEE, "single_sided": SINGLE_SIDED,
+    "resolution": [WIDTH, HEIGHT], "scene": "test_room",
+  }
+
+  log_result("raw", raw_scores,
+             {**shared_config, "denoiser": "none"},
+             reference=ref_meta, hardware="RTX 5070 Ti")
+
+  log_result("svgf", svgf_scores,
+             {**shared_config, "denoiser": "svgf",
+              "warmup_frames": WARMUP_FRAMES,
+              "alpha_min": ALPHA_MIN, "atrous_levels": ATROUS_LEVELS},
+             reference=ref_meta, hardware="RTX 5070 Ti")
 
   print(f"\n>>> THE BAR: relMSE {svgf_scores['relmse']:.6f}")
   print("2.4 has to beat this, measured exactly this way.")
