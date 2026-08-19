@@ -16,11 +16,11 @@ def pan(frame, rate_deg=0.2, base_position=vec3(0.0, 1.2, 4.0), base_yaw=0.0):
 def orbit(frame, radius=4.0, rate_deg=0.2, target=vec3(0.0, 1.0, 0.0), elevation=0.2):
   theta = math.radians(rate_deg * frame)
   x = target.x + radius * math.sin(theta)
-  z = target.y + radius * math.cos(theta)
+  z = target.z + radius * math.cos(theta)
 
   position = vec3(x, target.y + elevation, z)
 
-  yaw = theta
+  yaw = -theta
 
   return position, yaw
 
