@@ -27,7 +27,7 @@ def smape(test, ref, eps=EPS, mask=None):
     return _reduce(s_ma_pe, mask)
   return s_ma_pe.mean()
 
-def report(img, test, ref, eps=EPS, mask = None):
+def report(test, ref, mask = None):
   return {
     "relmse": relmse(test, ref, mask=mask),
     "smape": smape(test, ref, mask=mask),
