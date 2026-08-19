@@ -9,7 +9,9 @@ from tracer.bvh import builder
 from tracer.camera import Camera
 from tracer.camera_path import scripted
 from tracer.denoise import history
+from tracer.denoise.atrous import filter_image, ATROUS_LEVELS
 from tracer.denoise.demodulate import demodulate, remodulate
+from tracer.denoise.moments import estimate_variance
 from tracer.denoise.reproject import reproject_kernel
 from tracer.environment import Environment, ENV_BLACK
 from tracer.geometry import scene
@@ -29,19 +31,18 @@ PITCH = math.radians(5)
 
 MAX_BOUNCES = 8
 
-# ⚠ SPP is now samples per frame with NO cross-frame accumulation. The
-# denoiser's whole job is to make a noisy per-frame estimate usable, so
-# feeding it a progressively-converged image would be testing nothing.
-# accumulate_kernel is called with frame_index=1 every frame, which makes
-# its running mean reduce to a plain assignment.
+# Samples per FRAME, with no cross-frame accumulation. The denoiser's job is
+# to make a noisy per-frame estimate usable, so feeding it a progressively
+# converged image would test nothing. accumulate_kernel is called with
+# frame_index=1 each frame, which reduces its running mean to an assignment.
 SPP = 2
 
 USE_NEE = 1
 SINGLE_SIDED = 1
 
-# Caps how far back history reaches. 0.05 is roughly a 20-frame window.
-# Larger means less noise and more ghosting -- this one number is the entire
-# temporal quality tradeoff.
+# Caps how far back temporal history reaches. 0.05 is roughly a 20-frame
+# window. Larger means less noise and more ghosting -- this one number is the
+# entire temporal quality tradeoff.
 ALPHA_MIN = 0.05
 
 # A camera jump larger than this invalidates all history.
@@ -63,17 +64,6 @@ def make_camera(position, yaw):
 def main():
   ti.init(arch=ti.cuda)
 
-  print("init ok")
-
-  scene.init_scene_fields()
-  build_test_room()
-  print("scene ok")
-
-  buffers.init_aov_fields(WIDTH, HEIGHT)
-  history.init_history_fields(WIDTH, HEIGHT)
-  history.reset()
-  print("buffers ok")
-
   scene.init_scene_fields()
   build_test_room()
   buffers.init_aov_fields(WIDTH, HEIGHT)
@@ -87,12 +77,27 @@ def main():
   environment = Environment(mode=ENV_BLACK)
 
   shape = (WIDTH, HEIGHT)
-  raw = ti.Vector.field(3, ti.f32, shape=shape)        # noisy radiance, linear
-  demod = ti.Vector.field(3, ti.f32, shape=shape)      # radiance / albedo
-  accum_col = ti.Vector.field(3, ti.f32, shape=shape)  # temporally accumulated
+
+  raw = ti.Vector.field(3, ti.f32, shape=shape)          # noisy radiance, linear
+  demod = ti.Vector.field(3, ti.f32, shape=shape)        # radiance / albedo
+  accum_col = ti.Vector.field(3, ti.f32, shape=shape)    # temporally accumulated
   accum_mom = ti.Vector.field(2, ti.f32, shape=shape)
   accum_len = ti.field(ti.i32, shape=shape)
-  final = ti.Vector.field(3, ti.f32, shape=shape)      # remodulated
+
+  # A-trous ping-pong. accum_col is the first source, so only one extra
+  # colour buffer is needed alongside it.
+  colour_b = ti.Vector.field(3, ti.f32, shape=shape)
+  variance_a = ti.field(ti.f32, shape=shape)
+  variance_b = ti.field(ti.f32, shape=shape)
+  var_prefiltered = ti.field(ti.f32, shape=shape)
+
+  # ⚠ Dedicated buffer for the level-one output. It cannot be a reference
+  # into the ping-pong pair: with five levels, the buffer holding level one
+  # is written again at level three, so a reference would silently give
+  # history the level-three image instead.
+  history_colour = ti.Vector.field(3, ti.f32, shape=shape)
+
+  final = ti.Vector.field(3, ti.f32, shape=shape)        # remodulated, for display
   display = ti.Vector.field(3, ti.f32, shape=shape)
 
   gui = ti.GUI("Project Albedo", res=(WIDTH, HEIGHT))  # type: ignore
@@ -106,7 +111,7 @@ def main():
     right, up, forward = camera.basis_from_yaw_pitch()
 
     # A teleport invalidates every pixel's history. Detected by distance
-    # rather than by frame number so it also catches the discontinuity where
+    # rather than frame number, so it also catches the discontinuity where
     # the scripted path switches phases.
     if prev is not None:
       if float(np.linalg.norm(np.asarray(position) - prev[2])) > CUT_DISTANCE:
@@ -136,8 +141,7 @@ def main():
     else:
       buffers.motion.fill(0.0)
 
-    # --- 3. Noisy radiance. frame_index=1 makes the running mean a plain
-    #        assignment -- one independent estimate per frame.
+    # --- 3. Noisy radiance, one independent estimate per frame.
     accumulate_kernel(
       raw, 1, right, up, forward, camera.position,
       camera.fov, camera.aspect_ratio,
@@ -150,7 +154,7 @@ def main():
       SINGLE_SIDED, USE_NEE, MAX_BOUNCES, SPP,
     )
 
-    # --- 4. Demodulate, so the filter sees irradiance not texture.
+    # --- 4. Demodulate, so the filter sees irradiance rather than texture.
     demodulate(raw, buffers.albedo, buffers.hit_mask, demod)
 
     # --- 5. Temporal accumulation.
@@ -162,19 +166,35 @@ def main():
       WIDTH, HEIGHT, ALPHA_MIN,
     )
 
-    # --- 6. TODO: variance from accum_mom, then the a-trous spatial filter.
-    #        Until those exist this is temporal-only denoising, which is
-    #        still worth looking at -- it should visibly stabilise a static
-    #        camera and ghost under motion.
+    # --- 6. Variance: temporal where history allows, spatial where it does not.
+    estimate_variance(
+      accum_mom, accum_len, accum_col,
+      buffers.depth, buffers.normal, buffers.object_id,
+      variance_a, WIDTH, HEIGHT,
+    )
 
-    # --- 7. Remodulate BEFORE display, but store the DEMODULATED result.
-    remodulate(accum_col, buffers.albedo, buffers.hit_mask, final)
+    var_snapshot = None
+    if (frame + 1) % 60 == 0:
+      var_snapshot = variance_a.to_numpy()
 
-    # --- 8. History takes the FILTERED, demodulated colour. Storing the raw
-    #        input would average noise into noise and never converge.
+    # --- 7. Spatial filter. history_colour is filled in place with the
+    #        level-one result; `filtered` is the level-five output.
+    filtered, _ = filter_image(
+      accum_col, colour_b, variance_a, variance_b, var_prefiltered,
+      history_colour,
+      buffers.depth, buffers.normal, buffers.object_id,
+      WIDTH, HEIGHT, levels=ATROUS_LEVELS,
+    )
+
+    # --- 8. Remodulate for display only. History stays demodulated.
+    remodulate(filtered, buffers.albedo, buffers.hit_mask, final)
+
+    # --- 9. ⚠ History takes LEVEL ONE, from its own buffer. Feeding level
+    #        five back compounds the blur every frame and a static camera
+    #        slowly dissolves into mush.
     history.store(
       buffers.normal, buffers.object_id, buffers.depth,
-      accum_col, accum_mom, accum_len,
+      history_colour, accum_mom, accum_len,
     )
 
     prev = (
@@ -189,8 +209,18 @@ def main():
 
     frame += 1
     if frame % 60 == 0:
-      print(f"frame {frame}  mean history length "
-            f"{accum_len.to_numpy().mean():.1f}")
+      lengths = accum_len.to_numpy()
+      geo = buffers.hit_mask.to_numpy() == 1
+      n_geo = int(geo.sum())
+
+      if n_geo == 0:
+        print(f"after frame {frame - 1}  NO GEOMETRY IN FRAME")
+      else:
+        pre = var_snapshot[geo].mean()  # type: ignore
+        post = variance_a.to_numpy()[geo].mean()
+        print(f"after frame {frame - 1}  history {lengths[geo].mean():.1f}  "
+              f"coverage {n_geo / (WIDTH * HEIGHT):.0%}  "
+              f"variance pre {pre:.4f} -> post {post:.5f}")
 
 
 if __name__ == "__main__":
