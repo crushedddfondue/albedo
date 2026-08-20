@@ -69,3 +69,43 @@ class SceneData:
     lo = np.array([-half[0], 0.0, -half[2]])
     hi = np.array([half[0], self.room_size[1], half[2]])
     return lo, hi
+
+def _tri_normal(a, b, c):
+  n = np.cross(b-a, c-a)
+  ln = np.linalg.norm(n)
+
+  return n / ln if n > 0.0 else n
+
+def _quad(a, b, c, d, want_normal):
+  a, b, c, d = (np.asarray(v, dtype=np.float64) for v in (a, b, c, d))
+
+  if np.dot(_tri_normal(a, b, c), want_normal) < 0.0:
+    a, b, c, d = a, d, c, b
+
+  return [(a, b, c), (a, c, d)]
+
+def _box_faces(lo, hi, inward=False):
+  x0, y0, z0 = lo
+  x1, y1, z1 = hi
+  s = -1.0 if inward else 1.0
+
+  faces = [
+    ((x1, y0, z1), (x1, y0, z0), (x1, y1, z0), (x1, y1, z1), (s, 0.0, 0.0)),
+    ((x0, y0, z0), (x0, y0, z1), (x0, y1, z1), (x0, y1, z0), (-s, 0.0, 0.0)),
+    ((x0, y1, z0), (x0, y1, z1), (x1, y1, z1), (x1, y1, z0), (0.0, s, 0.0)),
+    ((x0, y0, z1), (x0, y0, z0), (x1, y0, z0), (x1, y0, z1), (0.0, -s, 0.0)),
+    ((x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1), (0.0, 0.0, s)),
+    ((x1, y0, z0), (x0, y0, z0), (x0, y1, z0), (x1, y1, z0), (0.0, 0.0, -s)),
+  ]
+
+  tris = []
+  for a, b, c, d, n in faces:
+    tris.extend(_quad(a, b, c, d, np.asarray(n, dtype=np.float64)))
+  return tris
+
+def _random_albedo(rng, params):
+  base = rng.uniform(params.albedo_min, params.albedo_max)
+  tint = rng.uniform(-1.0, 1.0, size=3)
+  tint = tint / max(np.abs(tint).max(), 1e-9) * rng.uniform(0.0, params.saturation_max)
+  return np.clip(base * (1.0 + tint), params.albedo_min, params.albedo_max)
+
