@@ -1,4 +1,5 @@
 from dataclasses import dataclass, asdict, field
+from typing import Optional
 
 import numpy as np
 
@@ -48,7 +49,7 @@ class SceneData:
   light_index: np.ndarray
 
   light_triangle_index: np.ndarray
-  light_pdf_Area: np.ndarray
+  light_pdf_area: np.ndarray
 
   room_size: np.ndarray
   scene_id: str = ""
@@ -109,3 +110,179 @@ def _random_albedo(rng, params):
   tint = tint / max(np.abs(tint).max(), 1e-9) * rng.uniform(0.0, params.saturation_max)
   return np.clip(base * (1.0 + tint), params.albedo_min, params.albedo_max)
 
+
+def build_scene(params: SceneParams, seed: int, scene_id: Optional[str] = None) -> SceneData:
+  rng = np.random.default_rng(seed)
+  scene_id = scene_id if scene_id is not None else f"scene_{seed:08d}"
+
+  room = np.array([
+    rng.uniform(params.room_size_min[i], params.room_size_max[i]) for i in range(3)
+  ])
+  has_ceiling = bool(rng.random() < params.ceiling_probability)
+
+  half_x, half_z = room[0] * 0.5, room[2] * 0.5
+  room_lo = np.array([-half_x, 0.0, -half_z])
+  room_hi = np.array([half_x, room[1], half_z])
+
+  tri_v = []       
+  tri_albedo = []
+  tri_emission = []
+  tri_object = []
+
+  room_albedo = _random_albedo(rng, params)
+  for k, tri in enumerate(_box_faces(room_lo, room_hi, inward=True)):
+    is_ceiling = k in (4, 5)   # +Y face is faces[2] -> triangles 4 and 5
+    if is_ceiling and not has_ceiling:
+      continue
+    tri_v.append(tri)
+    tri_albedo.append(room_albedo)
+    tri_emission.append(np.zeros(3))
+    tri_object.append(0)
+
+  n_boxes = int(rng.integers(params.n_boxes_min, params.n_boxes_max + 1))
+  placed = []
+  next_object_id = 1
+
+  for _ in range(n_boxes):
+    for _attempt in range(24):
+      size = np.array([
+        rng.uniform(params.box_size_min[i], params.box_size_max[i]) for i in range(3)
+      ])
+      size[1] = min(size[1], room[1] * 0.6)
+
+      cx = rng.uniform(room_lo[0] + size[0] * 0.5, room_hi[0] - size[0] * 0.5)
+      cz = rng.uniform(room_lo[2] + size[2] * 0.5, room_hi[2] - size[2] * 0.5)
+
+      lo = np.array([cx - size[0] * 0.5, 0.0, cz - size[2] * 0.5])
+      hi = np.array([cx + size[0] * 0.5, size[1], cz + size[2] * 0.5])
+
+      if any(_overlaps_xz(lo, hi, p_lo, p_hi) for p_lo, p_hi in placed):
+        continue
+
+      placed.append((lo, hi))
+      box_albedo = _random_albedo(rng, params)
+      for tri in _box_faces(lo, hi, inward=False):
+        tri_v.append(tri)
+        tri_albedo.append(box_albedo)
+        tri_emission.append(np.zeros(3))
+        tri_object.append(next_object_id)
+      next_object_id += 1
+      break
+
+  n_lights = int(rng.integers(params.n_lights_min, params.n_lights_max + 1))
+  n_lights = min(n_lights, params.max_lights // TRIS_PER_QUAD)
+  light_y = room[1] * (1.0 - params.light_height_margin)
+
+  for _ in range(n_lights):
+    sx = rng.uniform(params.light_size_min, params.light_size_max)
+    sz = rng.uniform(params.light_size_min, params.light_size_max)
+    cx = rng.uniform(room_lo[0] + sx, room_hi[0] - sx)
+    cz = rng.uniform(room_lo[2] + sz, room_hi[2] - sz)
+
+    intensity = rng.uniform(params.light_intensity_min, params.light_intensity_max)
+    tint = 1.0 + rng.uniform(-0.15, 0.15, size=3)
+    emission = np.clip(intensity * tint, 0.0, None)
+
+    a = (cx - sx * 0.5, light_y, cz - sz * 0.5)
+    b = (cx + sx * 0.5, light_y, cz - sz * 0.5)
+    c = (cx + sx * 0.5, light_y, cz + sz * 0.5)
+    d = (cx - sx * 0.5, light_y, cz + sz * 0.5)
+
+    for tri in _quad(a, b, c, d, np.array([0.0, -1.0, 0.0])):
+      tri_v.append(tri)
+      tri_albedo.append(np.zeros(3))     # ⚠ zero albedo: this is what makes
+      tri_emission.append(emission)      #   the demodulation threshold matter
+      tri_object.append(next_object_id)
+    next_object_id += 1
+
+  n = len(tri_v)
+  if n > params.max_triangles:
+    raise ValueError(
+      f"scene {scene_id} emitted {n} triangles, over the field capacity of "
+      f"{params.max_triangles}. Lower n_boxes_max (each box is "
+      f"{TRIS_PER_BOX} triangles) or raise scene.MAX_TRIANGLES."
+    )
+
+  v0 = np.ascontiguousarray([t[0] for t in tri_v], dtype=np.float32)
+  v1 = np.ascontiguousarray([t[1] for t in tri_v], dtype=np.float32)
+  v2 = np.ascontiguousarray([t[2] for t in tri_v], dtype=np.float32)
+  albedo = np.ascontiguousarray(tri_albedo, dtype=np.float32)
+  emission = np.ascontiguousarray(tri_emission, dtype=np.float32)
+  object_id = np.ascontiguousarray(tri_object, dtype=np.int32)
+
+  light_index = np.full(n, -1, dtype=np.int32)
+  emissive = np.where(emission.max(axis=1) > 0.0)[0]
+
+  if emissive.size > params.max_lights:
+    raise ValueError(
+      f"scene {scene_id} has {emissive.size} emissive triangles, over "
+      f"MAX_LIGHTS = {params.max_lights}."
+    )
+
+  areas = 0.5 * np.linalg.norm(
+    np.cross(v1[emissive] - v0[emissive], v2[emissive] - v0[emissive]), axis=1
+  )
+  light_pdf_area = np.where(areas > 1e-8, 1.0 / np.maximum(areas, 1e-12), 0.0)
+  light_index[emissive] = np.arange(emissive.size, dtype=np.int32)
+
+  return SceneData(
+    v0=v0, v1=v1, v2=v2,
+    albedo=albedo, emission=emission,
+    object_id=object_id, light_index=light_index,
+    light_triangle_index=emissive.astype(np.int32),
+    light_pdf_area=light_pdf_area.astype(np.float32),
+    room_size=room,
+    scene_id=scene_id,
+    seed=int(seed),
+    meta={
+      "n_triangles": int(n),
+      "n_boxes": len(placed),
+      "n_light_quads": int(emissive.size // TRIS_PER_QUAD),
+      "has_ceiling": has_ceiling,
+      "room_size": room.tolist(),
+      "total_emission": float(emission.sum()),
+    },
+  )
+
+def _overlaps_xz(a_lo, a_hi, b_lo, b_hi, margin=0.15):
+  return (
+    a_lo[0] - margin < b_hi[0] and a_hi[0] + margin > b_lo[0] and
+    a_lo[2] - margin < b_hi[2] and a_hi[2] + margin > b_lo[2]
+  )
+
+
+def upload_scene(data: SceneData):
+  # from tracer.bvh import upload as bvh_upload
+
+  cap = scene.MAX_TRIANGLES
+  n = data.n_triangles
+
+  def _pad(arr, width=None, dtype=np.float32, fill=0.0):
+    shape = (cap,) if width is None else (cap, width)
+    out = np.full(shape, fill, dtype=dtype)
+    out[:n] = arr
+    return out
+
+  scene.triangles.v0.from_numpy(_pad(data.v0, 3))
+  scene.triangles.v1.from_numpy(_pad(data.v1, 3))
+  scene.triangles.v2.from_numpy(_pad(data.v2, 3))
+  scene.triangles.albedo.from_numpy(_pad(data.albedo, 3))
+  scene.triangles.emission.from_numpy(_pad(data.emission, 3))
+  scene.triangles.normal.from_numpy(np.zeros((cap, 3), dtype=np.float32))
+  scene.triangles.object_id.from_numpy(_pad(data.object_id, None, np.int32, -1))  # type: ignore
+  scene.triangles.light_index.from_numpy(_pad(data.light_index, None, np.int32, -1))  # type: ignore
+
+  scene.num_triangles[None] = n
+
+  light_idx = np.full(scene.MAX_LIGHTS, -1, dtype=np.int32)
+  light_pdf = np.zeros(scene.MAX_LIGHTS, dtype=np.float32)
+  light_idx[: data.n_lights] = data.light_triangle_index
+  light_pdf[: data.n_lights] = data.light_pdf_area
+
+  scene.light_triangle_index.from_numpy(light_idx)
+  scene.light_pdf_area.from_numpy(light_pdf)
+  scene.num_lights[None] = data.n_lights
+
+  scene.recompute_normals()
+
+  # bvh_upload.rebuild()
