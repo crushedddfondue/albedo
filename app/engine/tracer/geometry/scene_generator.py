@@ -252,7 +252,7 @@ def _overlaps_xz(a_lo, a_hi, b_lo, b_hi, margin=0.15):
 
 
 def upload_scene(data: SceneData):
-  # from tracer.bvh import upload as bvh_upload
+  from tracer.bvh import upload as bvh_upload
 
   cap = scene.MAX_TRIANGLES
   n = data.n_triangles
@@ -285,4 +285,4 @@ def upload_scene(data: SceneData):
 
   scene.recompute_normals()
 
-  # bvh_upload.rebuild()
+  bvh_upload.rebuild()
