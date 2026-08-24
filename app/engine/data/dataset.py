@@ -1,7 +1,8 @@
-import os
-from typing import Sequence, List, Dict
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
+
+from torch.utils.data import Dataset
 
 try:
   import torch
@@ -9,7 +10,7 @@ try:
   _HAS_TORCH = True
 except ImportError:                                   # pragma: no cover
   _HAS_TORCH = False
-  Dataset = object
+  Dataset = object                                    # type: ignore
 
 from data import transforms
 from data.manifest import Manifest
@@ -17,16 +18,19 @@ from data.shard import ShardReader
 
 DEFAULT_INPUT_CHANNELS = ("noisy", "albedo", "normal", "depth", "hit_mask")
 
-class AlbedoSequenceDataset:
-  def __init__(self, manifest: str, split: str = "train", seq_len: int = 8, window_stride: int = 1, augment: bool = True, crop: Sequence[int] | None = None, epoch_seed: int = 0, input_channels: Sequence[str] = DEFAULT_INPUT_CHANNELS, val_fraction: float | None = None, noisy_pair: bool = False):
-    if not _HAS_TORCH:
+
+class AlbedoSequenceDataset(Dataset): # type: ignore
+  """Windows of `seq_len` consecutive frames from one split of one dataset."""
+
+  def __init__(self, manifest, split: str = "train", seq_len: int = 8, window_stride: int = 1, augment: bool = True, crop: Optional[Sequence[int]] = None, epoch_seed: int = 0, input_channels: Sequence[str] = DEFAULT_INPUT_CHANNELS, val_fraction: Optional[float] = None, noisy_pair: bool = False):
+    if not _HAS_TORCH:                                # pragma: no cover
       raise ImportError("torch is required for AlbedoSequenceDataset")
 
     self.manifest = Manifest.load(manifest) if isinstance(manifest, str) else manifest
     self.split = split
     self.seq_len = int(seq_len)
     self.augment = bool(augment)
-    self.crop = tuple(crop) if crop else None 
+    self.crop = tuple(crop) if crop else None
     self.epoch_seed = int(epoch_seed)
     self.input_channels = tuple(input_channels)
     self.noisy_pair = bool(noisy_pair)
@@ -78,10 +82,14 @@ class AlbedoSequenceDataset:
       cam = seq["meta"]["frames"][(start - seq["start"]) + t]
       basis = (cam["right"], cam["up"], cam["forward"])
 
-      order = rng.permutation(n_real)
-      raw["noisy"] = raw["noisy"][:, :, order[0], :]
+      noisy_all = raw["noisy"]
+      if self.augment:
+        order = rng.permutation(n_real)
+      else:
+        order = np.arange(n_real)
+      raw["noisy"] = noisy_all[:, :, order[0], :]
       if self.noisy_pair:
-        raw["noisy2"] = reader.read_frame(start + t, copy=True)["noisy"][:, :, order[1], :]
+        raw["noisy2"] = noisy_all[:, :, order[1], :]
 
       f = transforms.to_model_space(raw, basis)
 
@@ -92,34 +100,41 @@ class AlbedoSequenceDataset:
 
       frames.append(f)
 
-    inp = np.stack([transforms.stack_channels(f, self.input_channels) for f in frames])
-    target = np.stack([f["clean"].astype(np.float32).transpose(2, 0, 1) for f in frames])
-    motion = np.stack([f["motion"].astype(np.float32).transpose(2, 0, 1) for f in frames])
-    albedo = np.stack([f["albedo"].astype(np.float32).transpose(2, 0, 1) for f in frames])
-    hit = np.stack([f["hit_mask"].astype(np.float32)[None] for f in frames])
-    oid = np.stack([f["object_id"].astype(np.int32)[None] for f in frames])
+    def _chw(name, dtype=np.float32):
+      return np.stack([f[name].astype(dtype).transpose(2, 0, 1) for f in frames])
 
-    return {
-      "input": torch.from_numpy(inp),          # (T, C, H, W)
-      "target": torch.from_numpy(target),      # (T, 3, H, W) linear HDR
-      "motion": torch.from_numpy(motion),      # (T, 2, H, W) pixels, x already mirrored
-      "albedo": torch.from_numpy(albedo),      # (T, 3, H, W) for demodulation
-      "hit_mask": torch.from_numpy(hit),       # (T, 1, H, W)
-      "object_id": torch.from_numpy(oid),      # (T, 1, H, W)
+    out = {
+      "input": torch.from_numpy(
+        np.stack([transforms.stack_channels(f, self.input_channels) for f in frames])
+      ),                                          # (T, C, H, W)
+      "target": torch.from_numpy(_chw("clean")),  # (T, 3, H, W) linear HDR
+      "motion": torch.from_numpy(_chw("motion")), # (T, 2, H, W) px, x already mirrored
+      "albedo": torch.from_numpy(_chw("albedo")), # (T, 3, H, W) for demodulation
+      "hit_mask": torch.from_numpy(
+        np.stack([f["hit_mask"].astype(np.float32)[None] for f in frames])
+      ),                                          # (T, 1, H, W)
+      "object_id": torch.from_numpy(
+        np.stack([f["object_id"].astype(np.int32)[None] for f in frames])
+      ),                                          # (T, 1, H, W)
       "scene_id": seq["scene_id"],
       "flipped": do_flip,
       "index": i,
     }
 
-    
+    if self.noisy_pair:
+      out["noisy2"] = torch.from_numpy(_chw("noisy2"))
+
+    return out
+
+
 def make_loader(manifest, split="train", batch_size=4, seq_len=8, num_workers=4, epoch_seed=0, **kwargs):
   if not _HAS_TORCH:                                  # pragma: no cover
     raise ImportError("torch is required for make_loader")
 
-  ds = AlbedoSequenceDataset(manifest, split=split, seq_len=seq_len,
-                             augment=(split == "train"), epoch_seed=epoch_seed, **kwargs)
+  ds = AlbedoSequenceDataset(manifest, split=split, seq_len=seq_len, augment=(split == "train"), epoch_seed=epoch_seed, **kwargs)
+
   return torch.utils.data.DataLoader(
-    ds, batch_size=batch_size, shuffle=(split == "train"),  # type:ignore
+    ds, batch_size=batch_size, shuffle=(split == "train"),   # type: ignore
     num_workers=num_workers, pin_memory=True, drop_last=(split == "train"),
     persistent_workers=num_workers > 0,
   )
