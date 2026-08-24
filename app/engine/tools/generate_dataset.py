@@ -45,6 +45,10 @@ def parse_args(argv=None):
   p.add_argument("--width", type=int, default=512)
   p.add_argument("--height", type=int, default=288)
   p.add_argument("--spp", type=int, default=2, help="samples per noisy frame")
+  p.add_argument("--noisy-realizations", type=int, default=2,
+    help="independent noisy renders per frame. Costs ~1.2%% of render "
+    "time each and is the only augmentation with no domain gap; "
+    ">=2 also enables the Noise2Noise ablation. Costs bytes.")
   p.add_argument("--clean-chunks", type=int, default=16)
   p.add_argument("--clean-spp-per-chunk", type=int, default=32)
   p.add_argument("--max-bounces", type=int, default=8)
@@ -115,8 +119,9 @@ def scene_id_for(seed: int, index: int) -> str:
 # =============================================================================
 
 def print_budget(args) -> int:
-  per_frame = frame_bytes(args.width, args.height)
-  per_channel = channel_bytes(args.width, args.height)
+  n_real = args.noisy_realizations
+  per_frame = frame_bytes(args.width, args.height, noisy_realizations=n_real)
+  per_channel = channel_bytes(args.width, args.height, noisy_realizations=n_real)
   n_seq = args.scenes * args.trajectories_per_scene
   total_frames = n_seq * args.frames
   total = per_frame * total_frames
@@ -213,24 +218,13 @@ def _aov_frame(buffers):
     "normal": buffers.normal.to_numpy(),
     "depth": buffers.depth.to_numpy(),
     "motion": buffers.motion.to_numpy(),
-    "object_id": buffers.object_id.to_numpy(),
+    "object_id": buffers.object_id.to_numpy().astype(np.int16),
     "hit_mask": buffers.hit_mask.to_numpy().astype(np.uint8),
   }
 
 
 def calibrate(renderer, args, build_scene, upload_scene, scene_params,
               sample_trajectory, traj_params):
-  """Split-half sigma of the clean target, measured AFTER the main loop.
-
-  Separate pass, deliberately. clean_split_half() renders two extra halves
-  and therefore consumes the shared Taichi RNG stream; calling it inline
-  would shift every subsequent frame's samples and make dataset content a
-  function of --calibrate-frames. Running it last makes that impossible.
-
-  Uses scene 0 and its first trajectory so the number is comparable between
-  dataset generations, rather than being taken from whichever scene happened
-  to be resident when the loop ended.
-  """
   if args.calibrate_frames <= 0:
     return []
 
@@ -323,12 +317,6 @@ def main(argv=None):
   t_first = None
 
   def flush_shard():
-    """Close the open shard and record it.
-
-    ⚠ Separate from open_shard on purpose: merged, the final flush would also
-    create an empty trailing shard, and an empty .bin with a valid sidecar is
-    a file every reader has to special-case.
-    """
     nonlocal writer, writer_seq_count
     if writer is None:
       return
@@ -345,9 +333,11 @@ def main(argv=None):
     flush_shard()
     shard_index += 1
     writer = ShardWriter(
-      os.path.join(args.out, f"shard_{shard_index:05d}"),
-      args.width, args.height, render_config=cfg.to_json(),
-    )
+    os.path.join(args.out, f"shard_{shard_index:05d}"),
+    args.width, args.height,
+    noisy_realizations=args.noisy_realizations,
+    render_config=cfg.to_json(),
+  )
 
   try:
     for s in range(args.scenes):
@@ -413,7 +403,11 @@ def main(argv=None):
 
         for cam in cameras:
           renderer.render_aovs(cam)
-          noisy = renderer.render_noisy(cam).to_numpy()
+          noisy = np.stack(
+            [renderer.render_noisy(cam).to_numpy()
+             for _ in range(args.noisy_realizations)],
+            axis=2,
+          )
           clean = renderer.render_clean(cam).to_numpy()
           writer.write_frame(noisy=noisy, clean=clean, **_aov_frame(buffers)) # type: ignore
           renderer.commit_frame(cam)
