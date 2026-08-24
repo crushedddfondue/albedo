@@ -5,7 +5,7 @@ from typing import Dict, List
 
 import numpy as np
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 CONVENTIONS = {
   "ndc_y": "lower-left",
@@ -16,26 +16,32 @@ CONVENTIONS = {
   "radiance": "linear_hdr_unclamped",
 }
 
-CHANNEL_SPEC = (
-  ("noisy",     np.dtype(np.float16), 3),
+
+BASE_SPEC = (
   ("clean",     np.dtype(np.float16), 3),
   ("albedo",    np.dtype(np.float16), 3),
   ("normal",    np.dtype(np.float16), 3),
   ("depth",     np.dtype(np.float32), 1),
   ("motion",    np.dtype(np.float32), 2),
-  ("object_id", np.dtype(np.int32),   1),
-  ("hit_mask",  np.dtype(np.uint8),   1),
+  ("object_id", np.dtype(np.int16),   1),
 )
 
+OBJECT_ID_MAX = 32767
 F16_MAX = 65504.0
 
+def channel_spec(noisy_realizations: int = 1):
+  if noisy_realizations < 1:
+    raise ValueError(f"noisy_realizations must be >= 1, got {noisy_realizations}")
+  return (("noisy", np.dtype(np.float16), 3 * noisy_realizations),) + BASE_SPEC
 
-def channel_bytes(width: int, height: int, spec=CHANNEL_SPEC) -> Dict[str, int]:
+CHANNEL_SPEC = channel_spec(1)
+
+def channel_bytes(width: int, height: int, spec=None, noisy_realizations: int = 1) -> Dict[str, int]:
+  spec = spec if spec is not None else channel_spec(noisy_realizations)
   return {name: width * height * c * dt.itemsize for name, dt, c in spec}
 
-
-def frame_bytes(width: int, height: int, spec=CHANNEL_SPEC) -> int:
-  return sum(channel_bytes(width, height, spec).values())
+def frame_bytes(width: int, height: int, spec=None, noisy_realizations: int = 1) -> int:
+  return sum(channel_bytes(width, height, spec, noisy_realizations).values())
 
 @dataclass
 class SequenceRecord:
@@ -66,11 +72,12 @@ class SequenceRecord:
 
 
 class ShardWriter:
-  def __init__(self, path: str, width: int, height: int, spec=CHANNEL_SPEC, render_config: dict | None = None):
+  def __init__(self, path: str, width: int, height: int, noisy_realizations: int = 1, spec=None, render_config: dict | None = None):
     self.path = path if not path.endswith(".bin") else path[:-4]
     self.width = width
     self.height = height
-    self.spec = spec
+    self.noisy_realizations = int(noisy_realizations)
+    self.spec = spec if spec is not None else channel_spec(self.noisy_realizations)
     self.render_config = render_config or {}
     self.frame_bytes = frame_bytes(width, height, spec)
 
@@ -78,8 +85,8 @@ class ShardWriter:
     self.n_frames = 0
     self._open_seq: dict | None = None
 
-    self._clamped = {name: 0 for name, _, _ in spec}
-    self._nonfinite = {name: 0 for name, _, _ in spec}
+    self._clamped = {name: 0 for name, _, _ in self.spec}
+    self._nonfinite = {name: 0 for name, _, _ in self.spec}
 
     os.makedirs(os.path.dirname(os.path.abspath(self.path)) or ".", exist_ok=True)
     self._fh = open(self.path + ".bin", "wb")
@@ -110,8 +117,21 @@ class ShardWriter:
     if missing:
       raise ValueError(f"missing channels: {missing}")
 
+    hit_mask = channels.pop("hit_mask", None)
+    oid = np.asarray(channels["object_id"])
+    if hit_mask is not None:
+      if not np.array_equal(oid == -1, np.asarray(hit_mask) == 0):
+        raise ValueError("object_id == -1 must exactly match hit_mask == 0")
+    if int(oid.max()) > OBJECT_ID_MAX:
+      raise ValueError(
+        f"object_id {int(oid.max())} exceeds int16 range {OBJECT_ID_MAX}"
+      )
+    
     for name, dtype, c in self.spec:
       arr = np.asarray(channels[name])
+      if name == "noisy" and arr.ndim == 4:
+        # (W, H, N, 3) -> (W, H, 3N), realisations contiguous per pixel.
+        arr = arr.reshape(arr.shape[0], arr.shape[1], -1)
 
       want = (self.width, self.height) if c == 1 else (self.width, self.height, c)
       if arr.ndim == 2 and c == 1:
@@ -169,6 +189,7 @@ class ShardWriter:
         for n, dt, c in self.spec
       ],
       "frame_bytes": self.frame_bytes,
+      "noisy_realizations": self.noisy_realizations,
       "n_frames": self.n_frames,
       "sequences": [s.to_json() for s in self.sequences],
       "render_config": self.render_config,
@@ -204,6 +225,7 @@ class ShardReader:
 
     self.width, self.height = self.sidecar["resolution"]
     self.frame_bytes = self.sidecar["frame_bytes"]
+    self.noisy_realizations = int(self.sidecar.get("noisy_realizations", 1))
     self.n_frames = self.sidecar["n_frames"]
     self.sequences = [SequenceRecord.from_json(s) for s in self.sidecar["sequences"]]
 
@@ -230,7 +252,7 @@ class ShardReader:
   def __len__(self):
     return self.n_frames
 
-  def read_frame(self, index: int, channels=None, copy: bool = False) -> Dict[str, np.ndarray]:
+  def read_frame(self, index: int, channels=None, copy: bool = False, derive_hit_mask: bool = True) -> Dict[str, np.ndarray]:
     if not 0 <= index < self.n_frames:
       raise IndexError(f"frame {index} out of range [0, {self.n_frames})")
 
@@ -241,8 +263,17 @@ class ShardReader:
         continue
       n = self.width * self.height * c
       raw = self._mm[base + off: base + off + n * dt.itemsize]
-      arr = raw.view(dt).reshape((self.width, self.height) if c == 1 else (self.width, self.height, c))
+      if name == "noisy":
+        shape = (self.width, self.height, self.noisy_realizations, 3)
+      elif c == 1:
+        shape = (self.width, self.height)
+      else:
+        shape = (self.width, self.height, c)
+      arr = raw.view(dt).reshape(shape)
       out[name] = np.array(arr) if copy else arr
+
+    if derive_hit_mask and "object_id" in out:
+      out["hit_mask"] = (out["object_id"] != -1).astype(np.uint8)
     return out
 
   def sequence_for_frame(self, index: int) -> SequenceRecord:
