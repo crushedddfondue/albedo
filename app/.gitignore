@@ -21,7 +21,7 @@ public/
 .pytest_cache/
 
 # Dataset Directory
-dataset/
+datasets/
 
 # Archived Files
 archive.txt
