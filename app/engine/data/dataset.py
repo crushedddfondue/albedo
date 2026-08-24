@@ -106,7 +106,7 @@ def make_loader(manifest, split="train", batch_size=4, seq_len=8, num_workers=4,
   ds = AlbedoSequenceDataset(manifest, split=split, seq_len=seq_len,
                              augment=(split == "train"), epoch_seed=epoch_seed, **kwargs)
   return torch.utils.data.DataLoader(
-    ds, batch_size=batch_size, shuffle=(split == "train"),  # type: ignore
+    ds, batch_size=batch_size, shuffle=(split == "train"),  # type:ignore
     num_workers=num_workers, pin_memory=True, drop_last=(split == "train"),
     persistent_workers=num_workers > 0,
   )

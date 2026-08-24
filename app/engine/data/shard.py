@@ -145,6 +145,16 @@ class ShardWriter:
 
     self.n_frames += 1
 
+  def abort_sequence(self):
+    if self._open_seq is None:
+      return
+    keep = self._open_seq["start"] * self.frame_bytes
+    self._fh.flush()
+    self._fh.truncate(keep)
+    self._fh.seek(keep)
+    self.n_frames = self._open_seq["start"]
+    self._open_seq = None
+
   def close(self):
     if self._open_seq is not None:
       raise RuntimeError("close() with a sequence still open")
