@@ -18,7 +18,7 @@ from data.shard import ShardReader
 DEFAULT_INPUT_CHANNELS = ("noisy", "albedo", "normal", "depth", "hit_mask")
 
 class AlbedoSequenceDataset:
-  def __init__(self, manifest: str, split: str = "train", seq_len: int = 8, window_stride: int = 1, augment: bool = True, crop: Sequence[int] | None = None, epoch_seed: int = 0, input_channels: Sequence[str] = DEFAULT_INPUT_CHANNELS, val_fraction: float | None = None):
+  def __init__(self, manifest: str, split: str = "train", seq_len: int = 8, window_stride: int = 1, augment: bool = True, crop: Sequence[int] | None = None, epoch_seed: int = 0, input_channels: Sequence[str] = DEFAULT_INPUT_CHANNELS, val_fraction: float | None = None, noisy_pair: bool = False):
     if not _HAS_TORCH:
       raise ImportError("torch is required for AlbedoSequenceDataset")
 
@@ -29,6 +29,7 @@ class AlbedoSequenceDataset:
     self.crop = tuple(crop) if crop else None 
     self.epoch_seed = int(epoch_seed)
     self.input_channels = tuple(input_channels)
+    self.noisy_pair = bool(noisy_pair)
 
     self.index: List = []
     for shard_path, seq in self.manifest.sequences(split=split, val_fraction=val_fraction):
@@ -64,11 +65,23 @@ class AlbedoSequenceDataset:
     do_flip = self.augment and bool(rng.random() < 0.5)
     crop_offset = None
 
+    n_real = reader.noisy_realizations
+    if self.noisy_pair and n_real < 2:
+      raise ValueError(
+        f"noisy_pair needs >= 2 realisations, shard has {n_real}. "
+        f"Regenerate with --noisy-realizations 2."
+      )
+
     frames = []
     for t in range(self.seq_len):
       raw = reader.read_frame(start + t, copy=True)
       cam = seq["meta"]["frames"][(start - seq["start"]) + t]
       basis = (cam["right"], cam["up"], cam["forward"])
+
+      order = rng.permutation(n_real)
+      raw["noisy"] = raw["noisy"][:, :, order[0], :]
+      if self.noisy_pair:
+        raw["noisy2"] = reader.read_frame(start + t, copy=True)["noisy"][:, :, order[1], :]
 
       f = transforms.to_model_space(raw, basis)
 
