@@ -1,7 +1,7 @@
 import json
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 
@@ -66,7 +66,7 @@ class SequenceRecord:
 
 
 class ShardWriter:
-  def __init__(self, path: str, width: int, height: int, spec=CHANNEL_SPEC, render_config: Optional[dict] = None):
+  def __init__(self, path: str, width: int, height: int, spec=CHANNEL_SPEC, render_config: dict | None = None):
     self.path = path if not path.endswith(".bin") else path[:-4]
     self.width = width
     self.height = height
@@ -76,7 +76,7 @@ class ShardWriter:
 
     self.sequences: List[SequenceRecord] = []
     self.n_frames = 0
-    self._open_seq: Optional[dict] = None
+    self._open_seq: dict | None = None
 
     self._clamped = {name: 0 for name, _, _ in spec}
     self._nonfinite = {name: 0 for name, _, _ in spec}
@@ -84,7 +84,7 @@ class ShardWriter:
     os.makedirs(os.path.dirname(os.path.abspath(self.path)) or ".", exist_ok=True)
     self._fh = open(self.path + ".bin", "wb")
 
-  def begin_sequence(self, scene_id: str, scene_seed: int, trajectory_seed: int, meta: Optional[dict] = None):
+  def begin_sequence(self, scene_id: str, scene_seed: int, trajectory_seed: int, meta: dict | None = None):
     if self._open_seq is not None:
       raise RuntimeError("begin_sequence called with a sequence still open")
     self._open_seq = {
