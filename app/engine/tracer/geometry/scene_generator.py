@@ -19,8 +19,8 @@ class SceneParams:
   box_size_min: tuple = (0.3, 0.3, 0.3)
   box_size_max: tuple = (2.0, 2.5, 2.0)
 
-  albed_min: float = 0.05
-  albed_max: float = 0.9
+  albedo_min: float = 0.05
+  albedo_max: float = 0.9
   saturation_max: float = 0.6
 
   n_lights_min: int = 1
@@ -52,6 +52,7 @@ class SceneData:
   light_pdf_area: np.ndarray
 
   room_size: np.ndarray
+  occluders: np.ndarray = field(default_factory=lambda: np.zeros((0, 2, 3)))
   scene_id: str = ""
   seed: int = 0
   meta: dict = field(default_factory=dict)
@@ -75,7 +76,7 @@ def _tri_normal(a, b, c):
   n = np.cross(b-a, c-a)
   ln = np.linalg.norm(n)
 
-  return n / ln if n > 0.0 else n
+  return n / ln if ln > 0.0 else n
 
 def _quad(a, b, c, d, want_normal):
   a, b, c, d = (np.asarray(v, dtype=np.float64) for v in (a, b, c, d))
@@ -225,6 +226,8 @@ def build_scene(params: SceneParams, seed: int, scene_id: Optional[str] = None) 
   light_pdf_area = np.where(areas > 1e-8, 1.0 / np.maximum(areas, 1e-12), 0.0)
   light_index[emissive] = np.arange(emissive.size, dtype=np.int32)
 
+  occluders = (np.asarray([[lo, hi] for lo, hi in placed], dtype=np.float64) if placed else np.zeros((0, 2, 3), dtype=np.float64))
+
   return SceneData(
     v0=v0, v1=v1, v2=v2,
     albedo=albedo, emission=emission,
@@ -232,6 +235,7 @@ def build_scene(params: SceneParams, seed: int, scene_id: Optional[str] = None) 
     light_triangle_index=emissive.astype(np.int32),
     light_pdf_area=light_pdf_area.astype(np.float32),
     room_size=room,
+    occluders=occluders,
     scene_id=scene_id,
     seed=int(seed),
     meta={
