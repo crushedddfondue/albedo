@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import List, Dict
 
 MANIFEST_VERSION = 1
+SPLIT_SALT = "albedo-p2.3"
 
 def scene_split(scene_id: str, val_fraction: float, salt: str = "albedo-p2.3") -> str:
   if not 0.0 <= val_fraction < 1.0:
@@ -50,9 +51,11 @@ class Manifest:
           ids.append(seq["scene_id"])
     return ids
 
-  def sequences(self, split: str | None = None, val_fraction: float | None = None, salt: str = "albedo-2.3"):
+  def sequences(self, split: str | None = None, val_fraction: float | None = None, salt: str | None = None):
     if val_fraction is None:
       val_fraction = self.config.get("val_fraction", 0.1)
+    if salt is None:
+      salt = self.config.get("split_salt", SPLIT_SALT)
 
     for shard in self.shards:
       path = os.path.join(self.root, shard["path"])
@@ -60,9 +63,11 @@ class Manifest:
         if split is None or scene_split(seq["scene_id"], val_fraction, salt) == split:  # type: ignore
           yield path, seq
 
-  def split_summary(self, val_fraction: float | None = None, salt: str = "albedo-2.3") -> Dict:
+  def split_summary(self, val_fraction: float | None = None, salt: str | None = None) -> Dict:
     if val_fraction is None:
       val_fraction = self.config.get("val_fraction", 0.1)
+    if salt is None:
+      salt = self.config.get("split_salt", SPLIT_SALT)
 
     out = {
       "train": {"scenes": set(), "sequences": 0, "frames": 0},
