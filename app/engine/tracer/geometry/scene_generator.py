@@ -171,8 +171,8 @@ def build_scene(params: SceneParams, seed: int, scene_id: Optional[str] = None) 
           or room_hi[2] - room_lo[2] <= 2.0 * half_diag):
         continue
 
-      cx = rng.uniform(room_lo[0] + size[0] * 0.5, room_hi[0] - size[0] * 0.5)
-      cz = rng.uniform(room_lo[2] + size[2] * 0.5, room_hi[2] - size[2] * 0.5)
+      cx = rng.uniform(room_lo[0] + half_diag, room_hi[0] - half_diag)
+      cz = rng.uniform(room_lo[2] + half_diag, room_hi[2] - half_diag)
 
       lo = np.array([cx - size[0] * 0.5, 0.0, cz - size[2] * 0.5])
       hi = np.array([cx + size[0] * 0.5, size[1], cz + size[2] * 0.5])
