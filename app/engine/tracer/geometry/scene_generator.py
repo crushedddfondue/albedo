@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass, asdict, field
 from typing import Optional
 
@@ -18,6 +19,7 @@ class SceneParams:
   n_boxes_max: int = 10
   box_size_min: tuple = (0.3, 0.3, 0.3)
   box_size_max: tuple = (2.0, 2.5, 2.0)
+  box_yaw_max: float = math.pi
 
   albedo_min: float = 0.05
   albedo_max: float = 0.9
@@ -105,6 +107,19 @@ def _box_faces(lo, hi, inward=False):
     tris.extend(_quad(a, b, c, d, np.asarray(n, dtype=np.float64)))
   return tris
 
+def _rotate_y(tris, centre, yaw):
+  c, s_ = math.cos(yaw), math.sin(yaw)
+
+  def r(v):
+    d = np.asarray(v, dtype=np.float64) - centre
+    return centre + np.array([c * d[0] + s_ * d[2], d[1], -s_ * d[0] + c * d[2]])
+
+  return [tuple(r(v) for v in tri) for tri in tris]
+
+def _tris_aabb(tris):
+  v = np.asarray([p for tri in tris for p in tri], dtype=np.float64)
+  return v.min(axis=0), v.max(axis=0)
+
 def _random_albedo(rng, params):
   base = rng.uniform(params.albedo_min, params.albedo_max)
   tint = rng.uniform(-1.0, 1.0, size=3)
@@ -151,18 +166,27 @@ def build_scene(params: SceneParams, seed: int, scene_id: Optional[str] = None) 
       ])
       size[1] = min(size[1], room[1] * 0.6)
 
+      half_diag = 0.5 * math.hypot(size[0], size[2])
+      if (room_hi[0] - room_lo[0] <= 2.0 * half_diag
+          or room_hi[2] - room_lo[2] <= 2.0 * half_diag):
+        continue
+
       cx = rng.uniform(room_lo[0] + size[0] * 0.5, room_hi[0] - size[0] * 0.5)
       cz = rng.uniform(room_lo[2] + size[2] * 0.5, room_hi[2] - size[2] * 0.5)
 
       lo = np.array([cx - size[0] * 0.5, 0.0, cz - size[2] * 0.5])
       hi = np.array([cx + size[0] * 0.5, size[1], cz + size[2] * 0.5])
 
-      if any(_overlaps_xz(lo, hi, p_lo, p_hi) for p_lo, p_hi in placed):
+      yaw = rng.uniform(0.0, params.box_yaw_max)
+      box_tris = _rotate_y(_box_faces(lo, hi, inward=False), np.array([cx, 0.0, cz]), yaw)
+      aabb_lo, aabb_hi = _tris_aabb(box_tris)
+
+      if any(_overlaps_xz(aabb_lo, aabb_hi, p_lo, p_hi) for p_lo, p_hi in placed):
         continue
 
-      placed.append((lo, hi))
+      placed.append((aabb_lo, aabb_hi))
       box_albedo = _random_albedo(rng, params)
-      for tri in _box_faces(lo, hi, inward=False):
+      for tri in box_tris:
         tri_v.append(tri)
         tri_albedo.append(box_albedo)
         tri_emission.append(np.zeros(3))
