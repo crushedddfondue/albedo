@@ -72,14 +72,14 @@ class SequenceRecord:
 
 
 class ShardWriter:
-  def __init__(self, path: str, width: int, height: int, noisy_realizations: int = 1, spec=None, render_config: dict | None = None):
+  def __init__(self, path: str, width: int, height: int, noisy_realizations: int = 1, spec_override=None, render_config: dict | None = None):
     self.path = path if not path.endswith(".bin") else path[:-4]
     self.width = width
     self.height = height
     self.noisy_realizations = int(noisy_realizations)
-    self.spec = spec if spec is not None else channel_spec(self.noisy_realizations)
+    self.spec = spec_override if spec_override is not None else channel_spec(self.noisy_realizations)
     self.render_config = render_config or {}
-    self.frame_bytes = frame_bytes(width, height, spec)
+    self.frame_bytes = frame_bytes(width, height, self.spec)
 
     self.sequences: List[SequenceRecord] = []
     self.n_frames = 0
