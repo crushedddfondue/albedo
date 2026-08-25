@@ -47,14 +47,17 @@ def test_regression_seed_20260823_is_no_longer_inside_a_box():
   """The seed that started this. Named explicitly so the failure is legible
   if it ever comes back, rather than surfacing as 'one of 200 seeds'."""
   data, poses, meta = _scene_and_poses(REGRESSION_SEED)
-  assert data.occluders.shape[0] == 8
+  # Occluder COUNT is not the claim -- it moves whenever the scene
+  # distribution changes, as it did when boxes gained a yaw. The claim is
+  # that this seed has occluders and the camera is outside all of them.
+  assert data.occluders.shape[0] > 0
   bad = invalid_poses(poses, data.occluders, TRAJ.obstacle_margin)
   assert bad == [], (
     f"{len(bad)}/{len(poses)} poses inside geometry: {bad[:8]}. "
     f"This is the exact configuration that rendered 32 black frames."
   )
   assert meta["invalid_poses"] == 0
-  assert meta["obstacles"] == 8
+  assert meta["obstacles"] == data.occluders.shape[0]
 
 
 @pytest.mark.parametrize("seed", list(SWEEP)[:200])
