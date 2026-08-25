@@ -89,8 +89,10 @@ def main(argv=None):
     if hit.any():
       noisy_mean.append(float(f["noisy"][hit].mean()))
       clean_mean.append(float(f["clean"][hit].mean()))
+
       if r.noisy_realizations > 1:
-        realization_std.append(float(f["noisy"][hit].astype(np.float64).std(axis=1).mean()))
+        d = f["noisy"][hit].astype(np.float64)
+        realization_std.append(float(np.sqrt(((d[:, 0] - d[:, 1]) ** 2).mean() / 2.0)))
       d = f["depth"][hit]
       depth_lo.append(float(d.min())); depth_hi.append(float(d.max()))
       n = f["normal"][hit].astype(np.float64)
@@ -137,8 +139,14 @@ def main(argv=None):
   print("one-sided gap means the two render paths disagree about the scene.)")
   if realization_std:
     rs = np.asarray(realization_std)
-    print(f"per-pixel std across realisations: mean {rs.mean():.4f}  "
-          f"-> the input noise level, measured")
+    print(f"input noise sigma at {render.get('spp')} spp: {rs.mean():.4f}   "
+          f"(split-half, same estimator as the clean target)")
+    cs = cfg.get("clean_split_half_sigma")
+    if cs:
+      print(f"ratio to clean target sigma: {rs.mean() / cs:.1f}x   "
+            f"(sqrt(clean_spp/spp) predicts "
+            f"{(render.get('clean_spp', 1) / max(render.get('spp', 1), 1)) ** 0.5:.1f}x)")
+      
   print(f"depth on geometry: {min(depth_lo):.3f} .. {max(depth_hi):.3f}")
   print(f"|normal| max deviation from 1: {max(normal_len):.2e}  (f16 storage)")
   print(f"object_id max: {oid_max}   (int16 ceiling 32767)")
