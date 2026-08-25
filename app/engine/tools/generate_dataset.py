@@ -1,26 +1,8 @@
-"""Headless dataset generation. No GUI, no window, no blocking.
+"""
+  Headless dataset generation. No GUI, no window, no blocking.
 
-`main.py` opens a ti.GUI and loops on gui.running -- fine for looking at a
-denoiser, impossible on a machine with no display or as a batch job. This is
-the entry point with no display dependency at all.
-
-Order of operations, and why:
-
-  1. Validate the arguments. A fat-fingered flag on an overnight job should
-     fail in the first second, not the third hour.
-  2. Print the byte budget and the split BEFORE rendering anything. Write the
-     expected value and the population down first, then run. A dataset whose
-     size is discovered when the disk fills is a dataset generated twice.
-  3. Render. Every completed sequence is durable: the shard sidecar and the
-     manifest are written on the way out of ANY exit path, including a crash,
-     so an abort at hour three leaves a smaller dataset rather than rubble.
-  4. Calibrate the target's own noise, in a SEPARATE pass, after rendering.
-     Separate because clean_split_half() consumes the shared Taichi RNG
-     stream -- running it inline would make dataset content depend on
-     --calibrate-frames.
-
-    python tools/generate_dataset.py --out datasets/albedo_v1 \
-        --scenes 64 --frames 32 --width 512 --height 288 --dry-run
+  python tools/generate_dataset.py --out datasets/albedo_v1 \
+      --scenes 64 --frames 32 --width 512 --height 288 --dry-run
 """
 
 import argparse
@@ -55,7 +37,7 @@ def parse_args(argv=None):
   p.add_argument("--seed", type=int, default=20260819)
   p.add_argument("--sequences-per-shard", type=int, default=8)
   p.add_argument("--val-fraction", type=float, default=0.12)
-  p.add_argument("--calibrate-frames", type=int, default=1,
+  p.add_argument("--calibrate-frames", type=int, default=8,
                  help="frames used for the split-half noise estimate; 0 to skip")
   p.add_argument("--resume", action="store_true",
                  help="skip sequences already recorded in an existing manifest")
@@ -94,8 +76,6 @@ def validate_args(args):
   if not 0.0 <= args.val_fraction < 1.0:
     raise SystemExit(f"error: --val-fraction must be in [0, 1), got {args.val_fraction}")
 
-  # A one-frame sequence has no previous frame, so every motion vector in it
-  # is zero. It writes data that looks valid and is silently useless.
   if args.frames < 2:
     raise SystemExit(f"error: --frames must be >= 2 for motion vectors, got {args.frames}")
 
@@ -105,18 +85,8 @@ def validate_args(args):
 
 
 def scene_id_for(seed: int, index: int) -> str:
-  """The ONE place a scene id is constructed.
-
-  The budget print and the render loop both need it, and the budget print is
-  a commitment you check afterwards. Two inline f-strings ninety lines apart
-  can drift, and then the reported split is a confident lie.
-  """
   return f"scene_{seed + index:08d}"
 
-
-# =============================================================================
-# Budget -- printed before anything is rendered
-# =============================================================================
 
 def print_budget(args) -> int:
   n_real = args.noisy_realizations
@@ -133,6 +103,7 @@ def print_budget(args) -> int:
   print(f"resolution: {args.width}x{args.height}")
   print(f"sequences: {n_seq} ({args.scenes} scenes x {args.trajectories_per_scene} trajectories)")
   print(f"frames: {total_frames} ({args.frames} per sequence)")
+  print(f"noisy realizations: {n_real} per frame")
   print()
 
   for name, b in per_channel.items():
@@ -157,8 +128,7 @@ def print_budget(args) -> int:
   print(f"primary samples: {samples / 1e9:.1f} G")
   print()
 
-  train = sum(1 for s in range(args.scenes)
-              if scene_split(scene_id_for(args.seed, s), args.val_fraction) == "train")
+  train = sum(1 for s in range(args.scenes) if scene_split(scene_id_for(args.seed, s), args.val_fraction) == "train")
   print(f"split: {train} train / {args.scenes - train} val SCENES "
         f"(val_fraction={args.val_fraction})")
   if args.scenes - train == 0:
@@ -167,23 +137,7 @@ def print_budget(args) -> int:
   return total
 
 
-# =============================================================================
-# Resume
-# =============================================================================
-
 def load_resume_state(out_dir: str):
-  """Read an existing manifest, if any. Returns (shards, done, last_shard_index).
-
-  `done` is the set of (scene_id, trajectory_seed) already on disk. Matching
-  on the pair rather than on a counter means the skip survives a change to
-  --sequences-per-shard between runs.
-
-  ⚠ A resumed run does NOT reproduce an uninterrupted one bit for bit. Taichi
-  seeds one RNG stream per program run, so sequences rendered after a resume
-  draw different samples than they would have. They are still valid,
-  independent samples of the same integrand -- the dataset is correct, just
-  not identical. Recorded in the manifest as `resumed`.
-  """
   path = os.path.join(out_dir, "dataset.json")
   if not os.path.exists(path):
     return [], set(), -1
@@ -202,17 +156,7 @@ def load_resume_state(out_dir: str):
   return list(manifest.shards), done, last_index
 
 
-# =============================================================================
-# Render
-# =============================================================================
-
 def _aov_frame(buffers):
-  """Pull the current AOV set as numpy, in native WHC.
-
-  ⚠ These keys must match data.shard.CHANNEL_SPEC. One place, so the two
-  cannot drift apart silently -- a renamed channel here is a `missing
-  channels` error at best and a mislabelled channel at worst.
-  """
   return {
     "albedo": buffers.albedo.to_numpy(),
     "normal": buffers.normal.to_numpy(),
@@ -223,8 +167,7 @@ def _aov_frame(buffers):
   }
 
 
-def calibrate(renderer, args, build_scene, upload_scene, scene_params,
-              sample_trajectory, traj_params):
+def calibrate(renderer, args, build_scene, upload_scene, scene_params, sample_trajectory, traj_params):
   if args.calibrate_frames <= 0:
     return []
 
@@ -241,22 +184,19 @@ def save_manifest(args, argv, shards, calib, cfg, scene_params, traj_params, res
     version=MANIFEST_VERSION,
     config={
       "generator": "phase_2.3",
-      # Full invocation. The dataset is reproducible only for an identical
-      # one, because a single Taichi RNG stream makes every frame's samples
-      # depend on everything drawn before it.
       "argv": list(argv),
       "seed": args.seed,
       "scenes": args.scenes,
       "trajectories_per_scene": args.trajectories_per_scene,
       "frames_per_sequence": args.frames,
       "sequences_per_shard": args.sequences_per_shard,
+      "noisy_realizations": args.noisy_realizations,
       "calibrate_frames": args.calibrate_frames,
       "val_fraction": args.val_fraction,
       "resumed": resumed,
       "render": cfg.to_json(),
       "scene_params": scene_params.to_json(),
       "trajectory_params": traj_params.to_json(),
-      # The number that says whether the targets can adjudicate anything.
       "clean_split_half_sigma": float(np.mean(calib)) if calib else None,
       "clean_split_half_samples": len(calib),
     },
@@ -276,8 +216,6 @@ def main(argv=None):
     print("dry run: nothing rendered.")
     return 0
 
-  # Imported here, after the budget print, so --dry-run never pays for a
-  # Taichi init or a CUDA context. Do NOT hoist these to the top of the file.
   import taichi as ti
   from tracer import buffers
   from tracer.geometry.scene_generator import SceneParams, build_scene, upload_scene
@@ -303,9 +241,6 @@ def main(argv=None):
   scene_params = SceneParams()
   traj_params = TrajectoryParams()
 
-  # ⚠ None, not a ShardWriter. flush_shard() returns early on None, and that
-  # is what stops the first open_shard() from closing and recording a shard
-  # that has written nothing.
   writer = None
   writer_seq_count = 0
 
@@ -350,8 +285,6 @@ def main(argv=None):
       if not pending:
         continue
 
-      # Uploaded only once the scene is known to have work left. upload_scene
-      # rebuilds the BVH on the host, which is not free.
       data = build_scene(scene_params, scene_seed, scene_id=scene_id)
       upload_scene(data)
 
@@ -367,11 +300,6 @@ def main(argv=None):
           seq_seen += 1
           continue
 
-        # Cameras and bases are a pure function of the poses, so the whole
-        # per-frame metadata block is built BEFORE rendering. The dataset then
-        # never has to reconstruct a basis from yaw/pitch -- which would be a
-        # second implementation of basis_from_yaw_pitch, and the two would
-        # eventually disagree.
         cameras = [renderer.make_camera(p) for p in poses]
         frame_meta = []
         for pose, cam in zip(poses, cameras):
@@ -417,9 +345,6 @@ def main(argv=None):
         seq_seen += 1
         seq_written += 1
 
-        # Timed from the END of the first sequence. That one carries the
-        # Taichi JIT for every kernel in the pipeline, and including it makes
-        # the early ETAs badly pessimistic.
         if t_first is None:
           t_first = time.perf_counter()
           print(f"[{seq_seen}/{n_seq}] {scene_id} {traj_meta['kind']} "
@@ -435,9 +360,6 @@ def main(argv=None):
                       sample_trajectory, traj_params)
 
   except BaseException:
-    # Salvage. The in-progress sequence is truncated away rather than left
-    # partial: the Dataset builds its window index from `count`, so a sequence
-    # claiming 32 frames while holding 11 produces reads past end of file.
     print()
     print("aborting: discarding the in-progress sequence, keeping completed ones")
     if writer is not None:
@@ -445,9 +367,6 @@ def main(argv=None):
     raise
 
   finally:
-    # Both run on every exit path. A manifest listing four of eight shards is
-    # a usable dataset; no manifest makes four good shards landfill, because
-    # the sidecar is the only record of the channel layout.
     flush_shard()
     manifest, path = save_manifest(
       args, argv, shards, calib, cfg, scene_params, traj_params, resumed=args.resume
