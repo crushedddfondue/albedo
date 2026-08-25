@@ -1,3 +1,16 @@
+"""Read a rendered dataset back off disk and describe it.
+
+The generator prints what it INTENDS to write. This reads what actually
+landed. A dataset bug found by a histogram costs a minute; found after a
+training run, a day.
+
+Every number here is a population statistic over real frames, not a spot
+check on frame zero -- the camera-inside-a-box bug survived a spot check on
+one seed and was only visible as a distribution.
+
+    python tools/inspect_dataset.py datasets/pilot
+"""
+
 import argparse
 import os
 import sys
@@ -18,7 +31,8 @@ def pct(a, ps=(1, 5, 25, 50, 75, 95, 99)):
 def main(argv=None):
   ap = argparse.ArgumentParser(description="Describe a rendered dataset.")
   ap.add_argument("root", help="dataset directory containing dataset.json")
-  ap.add_argument("--max-frames", type=int, default=400, help="cap on frames read, sampled evenly across sequences")
+  ap.add_argument("--max-frames", type=int, default=400,
+                  help="cap on frames read, sampled evenly across sequences")
   args = ap.parse_args(argv)
 
   m = Manifest.load(args.root)
@@ -37,10 +51,17 @@ def main(argv=None):
   print(f"clean target own sigma: {sigma if sigma is None else f'{sigma:.6f}'}")
   print()
 
+  # calibrate() measures the clean sigma on scene 0 and nothing else. Any
+  # comparison against it has to be made on the same scene or it is comparing
+  # populations, not sample counts.
+  seed = cfg.get("seed")
+  calib_scene = None if seed is None else f"scene_{int(seed):08d}"
+
   for split, v in m.split_summary().items():
     print(f"{split}: {v['scenes']} scenes, {v['sequences']} sequences, {v['frames']} frames")
   print()
 
+  # --- write-time defects recorded by the writer -------------------------
   clamped, nonfinite, total_frames = {}, {}, 0
   readers = []
   for shard in m.shards:
@@ -56,6 +77,7 @@ def main(argv=None):
   print(f"non-finite zeroed: {nonfinite or 'none'}")
   print()
 
+  # --- sample frames evenly across every sequence ------------------------
   picks = []
   for r in readers:
     for s in r.sequences:
@@ -67,6 +89,7 @@ def main(argv=None):
 
   cov, first_motion, later_motion, out_of_frame = [], [], [], []
   noisy_mean, clean_mean, realization_std = [], [], []
+  direct_std, pair_rho, calib_real_std = [], [], []
   depth_lo, depth_hi, normal_len = [], [], []
   oid_max, per_scene = 0, {}
 
@@ -80,6 +103,9 @@ def main(argv=None):
     mag = np.linalg.norm(f["motion"].astype(np.float64), axis=-1)
     (first_motion if t == 0 else later_motion).append(float(mag.max()))
 
+    # Reprojection target outside the frame: a proxy for disocclusion
+    # pressure. Not the true rate -- that needs the depth/id rejection too --
+    # but it is the part driven purely by how fast the camera moves.
     W, H = r.width, r.height
     xs = np.arange(W)[:, None] + 0.5 + f["motion"][..., 0].astype(np.float64)
     ys = np.arange(H)[None, :] + 0.5 + f["motion"][..., 1].astype(np.float64)
@@ -89,12 +115,35 @@ def main(argv=None):
     if hit.any():
       noisy_mean.append(float(f["noisy"][hit].mean()))
       clean_mean.append(float(f["clean"][hit].mean()))
-
       if r.noisy_realizations > 1:
+        # Split-half sigma of ONE realisation: RMS(a - b) / sqrt(2).
+        #
+        # ⚠ Not np.std(axis=1).mean(). Two samples with ddof=0 give |a-b|/2,
+        # low by sqrt(2), and averaging a heavy-tailed quantity gives a mean
+        # where the comparable figure is an RMS -- MC noise has fireflies, so
+        # the mean lands far below. This form is the same estimator
+        # make_reference.py uses, which makes it directly comparable to
+        # clean_split_half_sigma.
         d = f["noisy"][hit].astype(np.float64)
-        realization_std.append(float(np.sqrt(((d[:, 0] - d[:, 1]) ** 2).mean() / 2.0)))
-      d = f["depth"][hit]
-      depth_lo.append(float(d.min())); depth_hi.append(float(d.max()))
+        tgt = f["clean"][hit].astype(np.float64)
+        sh = float(np.sqrt(((d[:, 0] - d[:, 1]) ** 2).mean() / 2.0))
+        realization_std.append(sh)
+        if s.scene_id == calib_scene:
+          calib_real_std.append(sh)
+
+        # ⚠ Load-bearing, not decoration. Split-half measures sigma*sqrt(1-rho)
+        # and therefore CANNOT tell a quiet render from two realisations that
+        # share random numbers -- the one failure that silently voids the
+        # noise2noise pairing. The clean target is ~10x quieter than one
+        # realisation, so it stands in for the true mean and contributes only
+        # sigma_clean^2, about 1% of sigma_noisy^2, to both residuals.
+        r0, r1 = d[:, 0] - tgt, d[:, 1] - tgt
+        v0, v1 = float((r0 ** 2).mean()), float((r1 ** 2).mean())
+        direct_std.append(float(np.sqrt(v0)))
+        if v0 > 0.0 and v1 > 0.0:
+          pair_rho.append(float((r0 * r1).mean() / np.sqrt(v0 * v1)))
+      dep = f["depth"][hit]
+      depth_lo.append(float(dep.min())); depth_hi.append(float(dep.max()))
       n = f["normal"][hit].astype(np.float64)
       normal_len.append(float(np.abs(np.linalg.norm(n, axis=1) - 1.0).max()))
       oid_max = max(oid_max, int(f["object_id"][hit].max()))
@@ -124,6 +173,12 @@ def main(argv=None):
         f"(MUST be 0.0 -- no previous frame exists)")
   lm = np.asarray(later_motion)
   print(f"later frames max px:   mean {lm.mean():.2f}   {pct(lm, (50, 90, 99))}")
+  # p90 and p99 landing on the same value means the rotating processes are
+  # pinned to yaw_rate_max rather than sampling a range of speeds.
+  p90, p99 = np.percentile(lm, [90, 99])
+  if p99 > 0 and (p99 - p90) / p99 < 0.02:
+    print(f"!! p90 and p99 agree to {100 * (p99 - p90) / p99:.1f}% -- motion is")
+    print("   saturating a cap, not sampling a distribution.")
   oof = np.asarray(out_of_frame)
   print(f"reprojects outside frame: mean {oof.mean():.2%}   {pct(oof, (50, 90, 99))}")
   print()
@@ -141,12 +196,28 @@ def main(argv=None):
     rs = np.asarray(realization_std)
     print(f"input noise sigma at {render.get('spp')} spp: {rs.mean():.4f}   "
           f"(split-half, same estimator as the clean target)")
+    if direct_std:
+      print(f"  same sigma vs the clean target: {np.mean(direct_std):.4f}   "
+            f"(independent of the pairing; must agree with the line above)")
+    if pair_rho:
+      rho = float(np.mean(pair_rho))
+      print(f"  correlation between realizations: {rho:+.4f}   "
+            f"(must be ~0; split-half reads sigma*sqrt(1-rho))")
+      if abs(rho) > 0.05:
+        print(f"!! rho={rho:+.3f} understates sigma by "
+              f"{100 * (1 - (1 - rho) ** 0.5):.0f}% AND voids noise2noise.")
     cs = cfg.get("clean_split_half_sigma")
     if cs:
-      print(f"ratio to clean target sigma: {rs.mean() / cs:.1f}x   "
-            f"(sqrt(clean_spp/spp) predicts "
-            f"{(render.get('clean_spp', 1) / max(render.get('spp', 1), 1)) ** 0.5:.1f}x)")
-      
+      pred = (render.get("clean_spp", 1) / max(render.get("spp", 1), 1)) ** 0.5
+      print(f"  ratio to clean target sigma: {rs.mean() / cs:.1f}x   "
+            f"(sqrt(clean_spp/spp) predicts {pred:.1f}x)")
+      if calib_real_std:
+        print(f"  ratio on {calib_scene} alone: "
+              f"{float(np.mean(calib_real_std)) / cs:.1f}x   "
+              f"({len(calib_real_std)} frames)")
+        print("  (the clean sigma is measured on that scene ONLY. Sigma is")
+        print("  absolute, and scene brightness varies, so the corpus-wide")
+        print("  ratio above mixes populations. This line is the matched one.)")
   print(f"depth on geometry: {min(depth_lo):.3f} .. {max(depth_hi):.3f}")
   print(f"|normal| max deviation from 1: {max(normal_len):.2e}  (f16 storage)")
   print(f"object_id max: {oid_max}   (int16 ceiling 32767)")

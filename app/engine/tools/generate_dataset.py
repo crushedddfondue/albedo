@@ -128,7 +128,8 @@ def print_budget(args) -> int:
   print(f"primary samples: {samples / 1e9:.1f} G")
   print()
 
-  train = sum(1 for s in range(args.scenes) if scene_split(scene_id_for(args.seed, s), args.val_fraction) == "train")
+  train = sum(1 for s in range(args.scenes)
+            if scene_split(scene_id_for(args.seed, s), args.val_fraction) == "train")
   print(f"split: {train} train / {args.scenes - train} val SCENES "
         f"(val_fraction={args.val_fraction})")
   if args.scenes - train == 0:
