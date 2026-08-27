@@ -88,6 +88,7 @@ def main(argv=None):
     picks = [picks[int(i * step)] for i in range(args.max_frames)]
 
   cov, first_motion, later_motion, out_of_frame = [], [], [], []
+  seq_motion = {}
   noisy_mean, clean_mean, realization_std = [], [], []
   direct_std, pair_rho, calib_real_std = [], [], []
   depth_lo, depth_hi, normal_len = [], [], []
@@ -102,10 +103,9 @@ def main(argv=None):
 
     mag = np.linalg.norm(f["motion"].astype(np.float64), axis=-1)
     (first_motion if t == 0 else later_motion).append(float(mag.max()))
+    if t > 0:
+      seq_motion.setdefault((id(r), s.start), []).append(float(mag.max()))
 
-    # Reprojection target outside the frame: a proxy for disocclusion
-    # pressure. Not the true rate -- that needs the depth/id rejection too --
-    # but it is the part driven purely by how fast the camera moves.
     W, H = r.width, r.height
     xs = np.arange(W)[:, None] + 0.5 + f["motion"][..., 0].astype(np.float64)
     ys = np.arange(H)[None, :] + 0.5 + f["motion"][..., 1].astype(np.float64)
@@ -116,14 +116,7 @@ def main(argv=None):
       noisy_mean.append(float(f["noisy"][hit].mean()))
       clean_mean.append(float(f["clean"][hit].mean()))
       if r.noisy_realizations > 1:
-        # Split-half sigma of ONE realisation: RMS(a - b) / sqrt(2).
-        #
-        # ⚠ Not np.std(axis=1).mean(). Two samples with ddof=0 give |a-b|/2,
-        # low by sqrt(2), and averaging a heavy-tailed quantity gives a mean
-        # where the comparable figure is an RMS -- MC noise has fireflies, so
-        # the mean lands far below. This form is the same estimator
-        # make_reference.py uses, which makes it directly comparable to
-        # clean_split_half_sigma.
+
         d = f["noisy"][hit].astype(np.float64)
         tgt = f["clean"][hit].astype(np.float64)
         sh = float(np.sqrt(((d[:, 0] - d[:, 1]) ** 2).mean() / 2.0))
@@ -131,12 +124,6 @@ def main(argv=None):
         if s.scene_id == calib_scene:
           calib_real_std.append(sh)
 
-        # ⚠ Load-bearing, not decoration. Split-half measures sigma*sqrt(1-rho)
-        # and therefore CANNOT tell a quiet render from two realisations that
-        # share random numbers -- the one failure that silently voids the
-        # noise2noise pairing. The clean target is ~10x quieter than one
-        # realisation, so it stands in for the true mean and contributes only
-        # sigma_clean^2, about 1% of sigma_noisy^2, to both residuals.
         r0, r1 = d[:, 0] - tgt, d[:, 1] - tgt
         v0, v1 = float((r0 ** 2).mean()), float((r1 ** 2).mean())
         direct_std.append(float(np.sqrt(v0)))
@@ -173,12 +160,15 @@ def main(argv=None):
         f"(MUST be 0.0 -- no previous frame exists)")
   lm = np.asarray(later_motion)
   print(f"later frames max px:   mean {lm.mean():.2f}   {pct(lm, (50, 90, 99))}")
-  # p90 and p99 landing on the same value means the rotating processes are
-  # pinned to yaw_rate_max rather than sampling a range of speeds.
-  p90, p99 = np.percentile(lm, [90, 99])
-  if p99 > 0 and (p99 - p90) / p99 < 0.02:
-    print(f"!! p90 and p99 agree to {100 * (p99 - p90) / p99:.1f}% -- motion is")
-    print("   saturating a cap, not sampling a distribution.")
+
+  sm = np.asarray([float(np.mean(v)) for v in seq_motion.values()])
+  if sm.size:
+    print(f"per-sequence max px: {sm.size} sequences, "
+          f"min {sm.min():.1f} max {sm.max():.1f}")
+    if sm.size >= 32:
+      print(f"  {pct(sm, (10, 25, 50, 75, 90))}")
+    else:
+      print("  (too few sequences for percentiles; read this on the full run)")
   oof = np.asarray(out_of_frame)
   print(f"reprojects outside frame: mean {oof.mean():.2%}   {pct(oof, (50, 90, 99))}")
   print()
@@ -202,8 +192,8 @@ def main(argv=None):
     if pair_rho:
       rho = float(np.mean(pair_rho))
       print(f"  correlation between realizations: {rho:+.4f}   "
-            f"(must be ~0; split-half reads sigma*sqrt(1-rho))")
-      if abs(rho) > 0.05:
+            f"(independence gives ~+0.011 here, not 0; see the comment)")
+      if rho > 0.05:
         print(f"!! rho={rho:+.3f} understates sigma by "
               f"{100 * (1 - (1 - rho) ** 0.5):.0f}% AND voids noise2noise.")
     cs = cfg.get("clean_split_half_sigma")

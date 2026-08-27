@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 
-from data.manifest import Manifest, MANIFEST_VERSION, scene_split
+from data.manifest import Manifest, MANIFEST_VERSION, scene_split, SPLIT_SALT
 from data.shard import ShardWriter, frame_bytes, channel_bytes
 
 
@@ -41,6 +41,8 @@ def parse_args(argv=None):
                  help="frames used for the split-half noise estimate; 0 to skip")
   p.add_argument("--resume", action="store_true",
                  help="skip sequences already recorded in an existing manifest")
+  p.add_argument("--force", action="store_true",
+                 help="overwrite an existing dataset in --out")
   p.add_argument("--dry-run", action="store_true",
                  help="print the budget and the split, render nothing")
   p.add_argument("--batch-size", type=int, default=4, help="for the bandwidth report only")
@@ -124,7 +126,9 @@ def print_budget(args) -> int:
   print()
 
   print(f"clean target: {spp_total} spp ({args.clean_chunks} x {args.clean_spp_per_chunk})")
-  samples = total_frames * (spp_total + args.spp) * args.width * args.height
+  # ⚠ args.spp * n_real, not args.spp. Every realisation is a separate render
+  # of the same camera, so the noisy cost scales with the realisation count.
+  samples = total_frames * (spp_total + args.spp * n_real) * args.width * args.height
   print(f"primary samples: {samples / 1e9:.1f} G")
   print()
 
@@ -194,6 +198,11 @@ def save_manifest(args, argv, shards, calib, cfg, scene_params, traj_params, res
       "noisy_realizations": args.noisy_realizations,
       "calibrate_frames": args.calibrate_frames,
       "val_fraction": args.val_fraction,
+      # ⚠ Recorded, not assumed. A dataset that does not carry its own salt
+      # can be silently re-split by a later change to SPLIT_SALT, and a
+      # re-split corpus moves scenes between train and val without anything
+      # raising. Manifest.split_summary and .sequences read this back.
+      "split_salt": SPLIT_SALT,
       "resumed": resumed,
       "render": cfg.to_json(),
       "scene_params": scene_params.to_json(),
@@ -216,6 +225,17 @@ def main(argv=None):
     print()
     print("dry run: nothing rendered.")
     return 0
+
+  # ⚠ A fresh run restarts shard numbering at 00000 and rebuilds `shards`
+  # from an empty list. Both are correct for a new dataset and catastrophic
+  # for a populated one: the previous run's shards keep their bytes and lose
+  # their only reference. Observed on pilot2, where an interrupted rerun left
+  # a 233 MB shard_00001.bin that no manifest mentioned.
+  if os.path.exists(os.path.join(args.out, "dataset.json")) and not (args.resume or args.force):
+    print()
+    print(f"refusing to write into {args.out}: dataset.json already exists.")
+    print("Use --resume to continue it, --force to overwrite, or a fresh --out.")
+    return 2
 
   import taichi as ti
   from tracer import buffers
@@ -269,11 +289,11 @@ def main(argv=None):
     flush_shard()
     shard_index += 1
     writer = ShardWriter(
-    os.path.join(args.out, f"shard_{shard_index:05d}"),
-    args.width, args.height,
-    noisy_realizations=args.noisy_realizations,
-    render_config=cfg.to_json(),
-  )
+      os.path.join(args.out, f"shard_{shard_index:05d}"),
+      args.width, args.height,
+      noisy_realizations=args.noisy_realizations,
+      render_config=cfg.to_json(),
+    )
 
   try:
     for s in range(args.scenes):
