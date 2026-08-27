@@ -1,4 +1,22 @@
+"""Render the held-out evaluation reference.
+
+The dataset's `clean` channel carries sigma ~0.0265, which puts a relMSE
+floor near 0.0029 -- roughly TWICE SVGF's measured 0.00140. That target can
+train a model under an unbiased loss. It cannot referee one. This renders a
+separate, much quieter reference on the validation split so a claim about
+0.00140 can actually be defended.
+
+    python tools/make_reference.py --dataset datasets/phase23 --out datasets/ref23late
+    python tools/make_reference.py --dataset datasets/phase23 --out datasets/ref23late --dry-run
+
+The poses are read back OUT OF THE MANIFEST rather than re-derived from
+sample_trajectory. That is deliberate: a reference is only a reference if it
+lands on the same pixels as the frame it judges, and re-deriving would make
+that correspondence depend on the trajectory sampler never changing again.
+"""
+
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -14,8 +32,17 @@ from metrics.image_metrics import EPS as RELMSE_EPS
 
 FORMAT_VERSION = 1
 
+# The bar. Hardcoded on purpose: this tool exists to say whether a reference
+# can resolve a difference against THIS number, and a flag would invite
+# quietly moving it.
 SVGF_RELMSE = 0.00140
 
+# reference RGB + per-pixel sigma, both f32.
+#
+# ⚠ f32, not f16. The whole point of this file is a quiet signal; f16 has
+# ~3 decimal digits, and sigma here is ~1e-3 of the radiance it sits next to.
+# Storing the reference in f16 would quantise away the precision it was
+# rendered to obtain.
 REF_CHANNELS = 4
 
 
@@ -26,9 +53,18 @@ def parse_args(argv=None):
   p.add_argument("--split", default="val", choices=("val", "train"),
                  help="which split to reference. val unless you know why not")
   p.add_argument("--frames-per-sequence", type=int, default=8,
-                 help="frames sampled evenly per sequence. Frames within one "
+                 help="frames sampled per sequence. Frames within one "
                       "trajectory are near-duplicates, so this buys far less "
                       "than the scene count does -- see effective_sample_size")
+  p.add_argument("--frame-selection", default="window", choices=("window", "spread"),
+                 help="window: one contiguous run per sequence, so temporal "
+                      "metrics are computable. spread: evenly spaced, which "
+                      "covers more of the trajectory but leaves no two "
+                      "referenced frames adjacent")
+  p.add_argument("--window-position", default="late", choices=("late", "early", "hashed"),
+                 help="where in each sequence the contiguous window sits. "
+                      "late gives maximum accumulated history, the steady "
+                      "state a real-time denoiser spends its life in")
   p.add_argument("--spp", type=int, default=16384,
                  help="total samples per reference frame, split across two halves")
   p.add_argument("--chunk-spp", type=int, default=32,
@@ -38,22 +74,17 @@ def parse_args(argv=None):
   p.add_argument("--resume", action="store_true")
   p.add_argument("--force", action="store_true", help="overwrite an existing reference set")
   p.add_argument("--dry-run", action="store_true")
-  p.add_argument("--frame-selection", default="window", choices=("window", "spread"),
-                 help="window: one contiguous run per sequence, so temporal "
-                "metrics are computable. spread: evenly spaced, which "
-                "covers more of the trajectory but leaves no two "
-                "referenced frames adjacent")
   return p.parse_args(argv)
 
 
 def validate_args(args):
-  """Fail before the CUDA context, not after three hours."""
+  """Fail before the CUDA context, not after an hour."""
   if args.spp < 2:
     raise SystemExit(f"error: --spp must be >= 2, got {args.spp}")
   if args.chunk_spp < 1:
     raise SystemExit(f"error: --chunk-spp must be >= 1, got {args.chunk_spp}")
   if args.frames_per_sequence < 1:
-    raise SystemExit(f"error: --frames-per-sequence must be >= 1")
+    raise SystemExit("error: --frames-per-sequence must be >= 1")
 
   half = args.spp // 2
   if half % args.chunk_spp != 0:
@@ -64,7 +95,40 @@ def validate_args(args):
     )
 
 
-def select_frames(manifest, split, per_sequence, max_scenes, selection="window"):
+def window_start(position, trajectory_seed, count, n):
+  """Where the contiguous window begins inside a sequence.
+
+  ⚠ NOT `trajectory_seed % (count - n + 1)`. Seeds are scene_seed * 1000,
+  count - n + 1 was 25, and 1000 is a multiple of 25 -- so that expression
+  returned 0 for every sequence in the corpus and silently placed every
+  window at frame 0. Modulo of a structured value is not a hash. An entire
+  reference set was rendered on cold-start frames before anything noticed,
+  and the only tell was the scorer printing `warmup 0` twenty-four times.
+  """
+  span = max(count - n + 1, 1)
+  if position == "late":
+    # SVGF's history saturates at 1/alpha_min = 20 frames. A window at the
+    # end of a 32-frame sequence is fully warmed; one at the start measures
+    # cold start, which is a legitimate question and a different one.
+    return max(0, count - n)
+  if position == "early":
+    return 0
+  h = hashlib.blake2b(str(trajectory_seed).encode("utf-8"), digest_size=8).digest()
+  return int.from_bytes(h, "big") % span
+
+
+def select_frames(manifest, split, per_sequence, max_scenes,
+                  selection="window", position="late"):
+  """(shard basename, seq, frame_indices) for every sequence in the split.
+
+  Sequences are grouped by scene by the caller, because uploading a scene is
+  the expensive part of switching and doing it per frame would dominate a run
+  whose per-frame cost is otherwise ~17 s.
+
+  ⚠ The shard is stored as a BASENAME. manifest.sequences() yields a
+  root-joined absolute path, and an absolute path written into a data file is
+  a join key that breaks the moment the dataset moves or is read elsewhere.
+  """
   picked, scenes = [], []
   for shard_path, seq in manifest.sequences(split=split):
     if seq["scene_id"] not in scenes:
@@ -76,19 +140,33 @@ def select_frames(manifest, split, per_sequence, max_scenes, selection="window")
     n = min(per_sequence, count)
 
     if selection == "window":
-      start = seq["trajectory_seed"] % max(count - n + 1, 1)
+      # ⚠ Contiguous, and that is the whole reason this branch exists.
+      # Temporal stability is measured between ADJACENT frames after
+      # reprojection. A set of evenly spaced references contains no adjacent
+      # pair, so it cannot support that metric at all -- and the gap is
+      # invisible until you try to compute it, by which point the render is
+      # spent.
+      start = window_start(position, seq["trajectory_seed"], count, n)
       idx = list(range(start, start + n))
     else:
       step = count / n
       idx = sorted({int(i * step) for i in range(n)})
 
-    picked.append((shard_path, seq, idx))
+    picked.append((os.path.basename(shard_path), seq, idx))
 
   picked.sort(key=lambda x: (x[1]["scene_id"], x[1]["trajectory_seed"]))
   return picked, scenes
 
 
 class ReferenceWriter:
+  """Fixed-stride f32, append-only, with the index rewritten per frame.
+
+  ⚠ The index is rewritten after EVERY frame, not at the end. At ~17 s per
+  frame a run is an hour long, and an index written only on exit turns any
+  interruption into a total loss. Rewriting a few-KB json per frame costs
+  nothing next to the render it follows.
+  """
+
   def __init__(self, root, width, height, config, resume=False):
     self.root = root
     self.width, self.height = width, height
@@ -106,11 +184,14 @@ class ReferenceWriter:
         raise SystemExit(f"error: reference is v{d['format_version']}, "
                          f"writer is v{FORMAT_VERSION}")
       self.entries = d["entries"]
+      # Truncate any partially written frame. A short final frame reads as
+      # garbage rather than failing, which is the worst possible outcome.
       want = len(self.entries) * self.stride
       have = os.path.getsize(self.bin_path) if os.path.exists(self.bin_path) else 0
       if have < want:
         raise SystemExit(f"error: {self.bin_path} holds {have} bytes but the "
-                         f"index claims {want}. Refusing to guess; rerun without --resume")
+                         f"index claims {want}. Refusing to guess; rerun "
+                         f"without --resume")
       self._fh = open(self.bin_path, "r+b")
       self._fh.truncate(want)
       self._fh.seek(want)
@@ -162,8 +243,9 @@ def print_budget(args, picked, scenes, render):
   w, h = render["width"], render["height"]
   per_frame = w * h * REF_CHANNELS * 4
   total = per_frame * n_frames
-
   scale = args.spp / max(render.get("clean_spp", 512), 1)
+
+  windows = sorted({idx[0] for _, _, idx in picked})
 
   print("=" * 70)
   print("REFERENCE BUDGET")
@@ -171,6 +253,10 @@ def print_budget(args, picked, scenes, render):
   print(f"source: {args.dataset}")
   print(f"split: {args.split}   scenes: {len(scenes)}   sequences: {len(picked)}")
   print(f"frames: {n_frames} ({args.frames_per_sequence} per sequence)")
+  print(f"selection: {args.frame_selection}/{args.window_position}")
+  # ⚠ Printed because the last run placed every window at frame 0 by
+  # accident and nothing said so until the scorer reported `warmup 0`.
+  print(f"window starts: {windows if len(windows) <= 6 else f'{len(windows)} distinct'}")
   print(f"resolution: {w}x{h}   bounces: {render.get('max_bounces')}")
   print()
   print(f"reference spp: {args.spp} (2 halves x {args.spp // 2})")
@@ -180,14 +266,27 @@ def print_budget(args, picked, scenes, render):
   print(f"per frame: {per_frame / 1024:.1f} KiB")
   print(f"on disk: {total / 1e9:.2f} GB")
   print()
-  print("PREDICTION -- the dataset's clean target took roughly 0.5 s/frame, so")
-  print(f"expect near {0.5 * scale:.0f} s/frame and {0.5 * scale * n_frames / 3600:.1f} h total.")
-  print("Record the real rate against that; it is a graded prediction, not an ETA.")
+  print(f"PREDICTION -- the previous run settled near 17 s/frame, so expect")
+  print(f"about {17.0 * n_frames / 60.0:.0f} min. Record the real rate against that.")
   print("=" * 70)
   return n_frames
 
 
 def relmse_floor(reference, sigma):
+  """What a PERFECT denoiser would score against this reference.
+
+  A perfect predictor emits the true mean mu. Its residual against the noisy
+  reference is exactly the reference's own error, whose per-pixel variance is
+  sigma^2. So the floor is
+
+      mean( sigma^2 / (reference + eps)^2 )
+
+  using the same eps as metrics/image_metrics.py, because a floor computed
+  with a different epsilon is not a floor for the metric you will report.
+
+  ⚠ This is the number the file exists to produce. If it is not comfortably
+  below SVGF_RELMSE, the reference cannot adjudicate and --spp must rise.
+  """
   denom = (reference.astype(np.float64) + RELMSE_EPS) ** 2
   return float((sigma.astype(np.float64)[..., None] ** 2 / denom).mean())
 
@@ -200,7 +299,8 @@ def main(argv=None):
   manifest = Manifest.load(args.dataset)
   render = manifest.config["render"]
   picked, scenes = select_frames(manifest, args.split, args.frames_per_sequence,
-                                 args.max_scenes, args.frame_selection)
+                                 args.max_scenes, args.frame_selection,
+                                 args.window_position)
   if not picked:
     raise SystemExit(f"error: no sequences in split '{args.split}'")
 
@@ -224,24 +324,28 @@ def main(argv=None):
 
   ti.init(arch=ti.cuda)
 
+  # ⚠ Reconstructed from the manifest, not from CLI defaults. width, height,
+  # fov, bounces, NEE and single-sidedness must match the frames being
+  # referenced EXACTLY or the reference describes a different image. Only the
+  # chunking is ours to choose.
   known = {f.name for f in dataclass_fields(RenderConfig)}
   cfg = RenderConfig(**{k: v for k, v in render.items() if k in known})
   half_chunks = (args.spp // 2) // args.chunk_spp
   renderer = get_renderer(cfg)
-  scene_params = SceneParams(**manifest.config.get("scene_params", {})) \
-    if isinstance(manifest.config.get("scene_params"), dict) else SceneParams()
+  scene_params = SceneParams()
 
   writer = ReferenceWriter(args.out, cfg.width, cfg.height,
                            config={
-                            "source_dataset": os.path.abspath(args.dataset),
-                            "split": args.split,
-                            "spp": args.spp,
-                            "chunk_spp": args.chunk_spp,
-                            "frames_per_sequence": args.frames_per_sequence,
-                            "frame_selection": args.frame_selection,
-                            "relmse_eps": RELMSE_EPS,
-                            "render": cfg.to_json(),
-                            "argv": argv,
+                             "source_dataset": os.path.abspath(args.dataset),
+                             "split": args.split,
+                             "spp": args.spp,
+                             "chunk_spp": args.chunk_spp,
+                             "frames_per_sequence": args.frames_per_sequence,
+                             "frame_selection": args.frame_selection,
+                             "window_position": args.window_position,
+                             "relmse_eps": RELMSE_EPS,
+                             "render": cfg.to_json(),
+                             "argv": argv,
                            },
                            resume=args.resume)
   done = writer.done_keys()
@@ -318,14 +422,12 @@ def main(argv=None):
       mean_floor = float(np.mean(floors))
       print(f"mean sigma: {np.mean(sigmas):.6f}")
       print(f"relMSE FLOOR: {mean_floor:.6f}")
-      print(f"SVGF: {SVGF_RELMSE:.5f}   ratio: {SVGF_RELMSE / mean_floor:.1f}x above the floor")
+      print(f"SVGF (static-camera, 720p): {SVGF_RELMSE:.5f}   "
+            f"ratio: {SVGF_RELMSE / mean_floor:.1f}x above the floor")
       if mean_floor > SVGF_RELMSE * 0.2:
         print("!! The floor is within 5x of the bar. This reference cannot")
-        print("!! resolve a modest improvement over SVGF. Raise --spp by 4x")
-        print("!! to halve it, and re-read topic 41(a) before spending the GPU time.")
-      else:
-        print("Floor is comfortably below the bar; differences of "
-              f"{mean_floor * 3:.5f} and up are resolvable per frame.")
+        print("!! resolve a modest improvement. Raise --spp by 4x to halve it,")
+        print("!! and re-read topic 41(a) before spending the GPU time.")
     print("=" * 70)
 
   return 0

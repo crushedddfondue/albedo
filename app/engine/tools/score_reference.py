@@ -33,12 +33,24 @@ from metrics.image_metrics import relmse, EPS as RELMSE_EPS
 REF_CHANNELS = 4
 
 
+def shard_key(p):
+  """Basename, always.
+
+  ⚠ make_reference recorded whatever manifest.sequences() handed it, and that
+  is root-joined and therefore absolute. An absolute path inside a data file
+  is a join key that breaks the moment the dataset directory moves or is read
+  on another machine, so normalise on the way in rather than trusting it.
+  """
+  return os.path.basename(str(p).replace("\\", "/").rstrip("/"))
+
+
 def parse_args(argv=None):
   p = argparse.ArgumentParser(description="Score a denoiser against the reference set.")
   p.add_argument("--dataset", required=True)
   p.add_argument("--reference", required=True, help="directory containing reference.json")
   p.add_argument("--method", default="svgf", help="label recorded in the results file")
-  p.add_argument("--out", default=None, help="results json; defaults to <reference>/score_<method>.json")
+  p.add_argument("--out", default=None,
+                 help="results json; defaults to <reference>/score_<method>.json")
   p.add_argument("--no-warmup", action="store_true",
                  help="score the window cold instead of replaying from frame 0. "
                       "Reports what a denoiser does with no history, which is a "
@@ -58,20 +70,21 @@ def load_reference(root):
     flat = mm[i]
     ref = flat[: w * h * 3].reshape(w, h, 3)
     sigma = flat[w * h * 3:].reshape(w, h)
-    return np.asarray(ref), np.asarray(sigma)
+    return np.array(ref), np.array(sigma)
 
   return index, get
 
 
 def sequence_map(manifest):
-  """(shard_path, frame) -> (seq, shard_path). Built once; the reference index
-  stores the join key but not the sequence bounds, and the warmup replay needs
-  to know where the sequence starts."""
+  """(shard basename, frame) -> seq. Built once; the reference index stores
+  the join key but not the sequence bounds, and the warmup replay needs to
+  know where the sequence starts."""
   out = {}
   for shard in manifest.shards:
+    key = shard_key(shard["path"])
     for seq in shard["sequences"]:
       for t in range(seq["count"]):
-        out[(shard["path"], seq["start"] + t)] = seq
+        out[(key, seq["start"] + t)] = seq
   return out
 
 
@@ -85,12 +98,12 @@ def main(argv=None):
     raise SystemExit("error: reference and dataset disagree on resolution")
 
   seq_of = sequence_map(manifest)
-  readers = {}
 
   # Group the scored frames by sequence so each sequence is replayed once.
   work = {}
   for i, e in enumerate(index["entries"]):
-    key = (e["shard"], seq_of[(e["shard"], e["frame"])]["start"])
+    shard = shard_key(e["shard"])
+    key = (shard, seq_of[(shard, e["frame"])]["start"])
     work.setdefault(key, []).append((i, e))
   for v in work.values():
     v.sort(key=lambda x: x[1]["frame"])
@@ -103,19 +116,33 @@ def main(argv=None):
   ti.init(arch=ti.cuda)
   known = {f.name for f in dataclass_fields(RenderConfig)}
   cfg = RenderConfig(**{k: v for k, v in render.items() if k in known})
+
+  # ⚠ No new fields after this point. Renderer.__init__ ends with
+  # history.reset(), which launches a kernel and materialises Taichi's field
+  # builder; declaring a field afterwards is undefined enough to segfault.
+  # renderer.raw is already the right type and is what render_and_denoise
+  # feeds to denoise(), so use it rather than allocating a parallel buffer.
   renderer = get_renderer(cfg)
-  raw = ti.Vector.field(3, ti.f32, shape=(cfg.width, cfg.height))
+
+  readers = {}
 
   def load_frame(reader, idx):
     """Push one stored frame into the AOV buffers the SVGF chain reads.
 
+    ⚠ copy=True is load-bearing. Without it read_frame returns read-only
+    VIEWS into the memmap, and Taichi's from_numpy writes through them --
+    a segfault, not an exception. It hides, too: f16 channels survive because
+    the dtype conversion inside ascontiguousarray copies anyway, so the crash
+    lands on the first channel already stored in its target dtype, which is
+    depth. albedo and normal passing is not evidence that the rest will.
+
     ⚠ Realisation 0, always. Which noisy realisation is scored must not
     depend on anything, or the bar moves between runs of the same code.
     """
-    f = reader.read_frame(idx)
+    f = reader.read_frame(idx, copy=True)
     noisy = f["noisy"]
     noisy = noisy[:, :, 0, :] if noisy.ndim == 4 else noisy
-    raw.from_numpy(np.ascontiguousarray(noisy, dtype=np.float32))
+    renderer.raw.from_numpy(np.ascontiguousarray(noisy, dtype=np.float32))
     buffers.albedo.from_numpy(np.ascontiguousarray(f["albedo"], dtype=np.float32))
     buffers.normal.from_numpy(np.ascontiguousarray(f["normal"], dtype=np.float32))
     buffers.depth.from_numpy(np.ascontiguousarray(f["depth"], dtype=np.float32))
@@ -140,13 +167,13 @@ def main(argv=None):
     # not the filter. The published 0.00140 used 120 warmup frames, so
     # anything less here would tilt the comparison the other way.
     first_scored = items[0][1]["frame"]
-    start = seq_start if not args.no_warmup else first_scored
+    start = first_scored if args.no_warmup else seq_start
     scored = {e["frame"]: i for i, e in items}
 
     renderer.reset_sequence()
     for idx in range(start, items[-1][1]["frame"] + 1):
       f = load_frame(reader, idx)
-      out = renderer.denoise(raw).to_numpy().astype(np.float64)
+      out = renderer.denoise(renderer.raw).to_numpy().astype(np.float64)
 
       if idx not in scored:
         continue
@@ -165,6 +192,9 @@ def main(argv=None):
 
     print(f"{seq['scene_id']} traj {seq['trajectory_seed']}: "
           f"{len(items)} frames, warmup {first_scored - start}")
+
+  if not rows:
+    raise SystemExit("error: nothing scored")
 
   vals = np.asarray([r["relmse"] for r in rows])
   hits = np.asarray([r["relmse_hit"] for r in rows])
@@ -194,17 +224,17 @@ def main(argv=None):
         f"({100 * floors.mean() / vals.mean():.1f}% of the score)")
   print()
   # ⚠ Per-SCENE, because frames inside one window are near-duplicates. The
-  # spread here is the number that decides how large an improvement is
-  # defensible -- see effective_sample_size.
+  # spread here is what decides how large an improvement is defensible --
+  # see effective_sample_size.
   print(f"per scene: {len(scene_means)} scenes, "
         f"min {scene_means.min():.6f} max {scene_means.max():.6f}")
   print(f"  median {np.median(scene_means):.6f}  "
         f"p25 {np.percentile(scene_means, 25):.6f}  "
         f"p75 {np.percentile(scene_means, 75):.6f}")
   print()
-  print(f"score_denoiser.py reported 0.00140 on ONE static-camera scene at")
-  print(f"1280x720 with 120 warmup frames. This is the matched number; the")
-  print(f"two are not interchangeable and only this one can judge the model.")
+  print("score_denoiser.py reported 0.00140 on ONE static-camera scene at")
+  print("1280x720 with 120 warmup frames. This is the matched number; the")
+  print("two are not interchangeable and only this one can judge the model.")
   print(f"results: {out_path}")
   print("=" * 70)
   return 0
